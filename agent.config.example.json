@@ -1,0 +1,16 @@
+{
+  "workerBaseUrl": "http://localhost:8787",
+  "uploadToken": "replace-with-upload-token",
+  "topN": 5,
+  "ssidOverride": "",
+  "passthroughCfstOutput": true,
+  "aliases": {
+    "MyHome-5G": "Home",
+    "Starbucks_SZ01": "Cafe-SZ"
+  },
+  "cfst": {
+    "binaryPath": "./cfst_darwin_arm64/cfst",
+    "workingDirectory": "./cfst_darwin_arm64",
+    "args": ["-tl", "200", "-dn", "10"]
+  }
+}

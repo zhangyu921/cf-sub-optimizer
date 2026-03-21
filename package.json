@@ -1,0 +1,24 @@
+{
+  "name": "cf-ip-choose",
+  "version": "1.0.0",
+  "description": "Multi-tenant Cloudflare IP choose service skeleton",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "agent": "npm run build && node dist/agent/cli.js run-once",
+    "agent:preview": "npm run build && node dist/agent/cli.js preview",
+    "worker:dev": "wrangler dev",
+    "worker:deploy": "wrangler deploy"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250913.0",
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.39.0"
+  }
+}

@@ -1,0 +1,14 @@
+name = "cf-ip-choose"
+main = "src/worker/index.ts"
+compatibility_date = "2026-03-19"
+compatibility_flags = ["nodejs_compat"]
+
+[[kv_namespaces]]
+binding = "TENANTS"
+id = "03a3da5cae8a4ef4ad0468d9e124874c"
+preview_id = "3d4bd9c9ca564e13b47847497411c537"
+
+[[kv_namespaces]]
+binding = "REPORTS"
+id = "ad63ad8749ba42e69bd968d50b0333c9"
+preview_id = "14ce702c41b447c0b44f58924b128cc4"

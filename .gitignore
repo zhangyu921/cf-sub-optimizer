@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Wrangler local dev state (KV, bundles, cache)
+.wrangler/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Secrets & local config (use agent.config.example.json as template)
+agent.config.json
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Local CFST binary + scan data (paths documented in agent.config.example.json)
+cfst_darwin_arm64/
+
+# Logs & debug
+*.log
+npm-debug.log*
+
+# Optional: coverage if you add tests later
+coverage/
