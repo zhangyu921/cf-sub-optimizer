@@ -462,6 +462,32 @@ async function getGroupReport(request: Request, env: Env): Promise<Response> {
   return json({ report });
 }
 
+async function deleteGroup(request: Request, env: Env): Promise<Response> {
+  const token = parseBearerToken(request);
+  const tenantId = extractTenantIdFromToken(token);
+  const tenant = await requireTenant(env, tenantId);
+
+  if (tenant.accessToken !== token) {
+    return errorResponse(401, "访问令牌无效");
+  }
+
+  const group = new URL(request.url).searchParams.get("group")?.trim();
+  if (!group) {
+    return errorResponse(400, "缺少分组名");
+  }
+
+  await env.REPORTS.delete(getReportKey(tenantId, group));
+
+  if (tenant.aliases?.[group]) {
+    const nextAliases = { ...tenant.aliases };
+    delete nextAliases[group];
+    const updated: TenantRecord = { ...tenant, aliases: nextAliases };
+    await env.TENANTS.put(getTenantKey(tenantId), JSON.stringify(updated));
+  }
+
+  return json({ ok: true, group });
+}
+
 async function getProxySubscription(request: Request, env: Env, tenantId: string): Promise<Response> {
   const tenant = await requireTenant(env, tenantId);
   const token = new URL(request.url).searchParams.get("token");
@@ -552,9 +578,16 @@ function landingPage(): string {
 </html>`;
 }
 
-function dashboardPage(origin: string, tenantId: string, accessToken: string, originSubscriptionUrl: string): string {
+function dashboardPage(
+  origin: string,
+  tenantId: string,
+  accessToken: string,
+  originSubscriptionUrl: string,
+  topN: number,
+): string {
   const subscriptionUrl = `${origin}/sub/${tenantId}?token=${accessToken}`;
   const dashboardUrl = `${origin}/dashboard/${tenantId}?token=${accessToken}`;
+  const escAttr = (s: string) => s.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;");
 
   return `<!doctype html>
 <html lang="zh-CN">
@@ -621,11 +654,15 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
     <a href="/" class="back-link">← 返回首页</a>
     <h1>管理面板</h1>
     <p class="subtitle">管理你的 Cloudflare IP 优选配置</p>
+    <div style="margin-bottom: 20px;">
+      <button class="danger-btn" type="button" id="delete-tenant-btn" onclick="deleteTenantWithConfirm()">移除订阅地址记录</button>
+      <p style="font-size:12px;color:#e00;margin-top:8px;">⚠️ 警告：将删除本订阅地址对应的全部租户数据（含所有分组与优选链接），无法恢复。</p>
+    </div>
 
     <div class="section">
       <div class="section-title">原始订阅/节点地址</div>
       <div class="url-box">
-        <input type="text" class="url-input" id="origin-sub-url" value="${originSubscriptionUrl}" readonly />
+        <input type="text" class="url-input" id="origin-sub-url" value="${escAttr(originSubscriptionUrl)}" readonly />
         <button class="copy-btn" onclick="copyUrl('origin-sub-url')">复制</button>
       </div>
       <p style="font-size:13px;color:#888;margin-top:8px;">这是当前 tenant 绑定的源地址，可以是 https 订阅链接或 vless:// 单节点链接，用于定位和生成节点模板</p>
@@ -634,7 +671,7 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
     <div class="section">
       <div class="section-title">优选订阅链接</div>
       <div class="url-box">
-        <input type="text" class="url-input" id="sub-url" value="${subscriptionUrl}" readonly />
+        <input type="text" class="url-input" id="sub-url" value="${escAttr(subscriptionUrl)}" readonly />
         <button class="copy-btn" onclick="copyUrl('sub-url')">复制</button>
       </div>
       <p style="font-size:13px;color:#888;margin-top:8px;">将此链接导入代理客户端（如 Hiddify）即可使用优选 IP</p>
@@ -643,7 +680,7 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
     <div class="section">
       <div class="section-title">管理链接</div>
       <div class="url-box">
-        <input type="text" class="url-input" id="dash-url" value="${dashboardUrl}" readonly />
+        <input type="text" class="url-input" id="dash-url" value="${escAttr(dashboardUrl)}" readonly />
         <button class="copy-btn" onclick="copyUrl('dash-url')">复制</button>
       </div>
       <p style="font-size:13px;color:#888;margin-top:8px;">保存此链接，下次可直接进入管理页面</p>
@@ -705,6 +742,7 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
 
     <script>
       const ACCESS_TOKEN = ${JSON.stringify(accessToken)};
+      const CSV_TOP_N = ${Math.max(1, Math.min(200, topN))};
       let currentEditGroup = "";
       let currentEditItems = [];
 
@@ -733,14 +771,32 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
       function parseCsv(text) {
         const lines = text.split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);
         if (lines.length <= 1) return [];
+        const coloCounters = {};
+        const fallbackCounters = {};
         return lines.slice(1).map((line) => {
           const [ip, , , loss, latency, speed, colo] = line.split(",");
+          const coloCode = (colo || "").trim().toUpperCase();
+          const lat = parseNumber(latency);
+          const spd = parseNumber(speed);
+          let name = "";
+          if (coloCode) {
+            coloCounters[coloCode] = (coloCounters[coloCode] || 0) + 1;
+            name = coloCode + "-" + String(coloCounters[coloCode]).padStart(2, "0");
+          } else {
+            const parts = [];
+            if (Number.isFinite(lat)) parts.push(Math.round(lat) + "ms");
+            if (Number.isFinite(spd) && spd > 0) parts.push(Math.round(spd) + "MB");
+            const base = parts.length > 0 ? parts.join("-") : "IP";
+            fallbackCounters[base] = (fallbackCounters[base] || 0) + 1;
+            name = base + "-" + String(fallbackCounters[base]).padStart(2, "0");
+          }
           return {
             ip: (ip || "").trim(),
+            name: name,
             loss: parseNumber(loss),
-            latency: parseNumber(latency),
-            speed: parseNumber(speed),
-            colo: colo || undefined,
+            latency: lat,
+            speed: spd,
+            colo: coloCode || undefined,
           };
         }).filter((r) => r.ip);
       }
@@ -917,11 +973,36 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
       }
 
       function handleGroupsContainerClick(event) {
-        const target = event.target.closest(".js-edit-group");
-        if (!target) return;
-        const groupName = target.dataset.group || "";
-        if (!groupName) return;
-        loadGroupForEdit(groupName);
+        if (event.target.classList.contains("js-edit-group")) {
+          const groupName = event.target.dataset.group || "";
+          if (!groupName) return;
+          loadGroupForEdit(groupName);
+          return;
+        }
+        if (event.target.classList.contains("js-delete-group")) {
+          const groupName = event.target.dataset.group || "";
+          if (!groupName) return;
+          deleteGroupWithConfirm(groupName);
+          return;
+        }
+      }
+
+      async function deleteGroupWithConfirm(groupName) {
+        if (!confirm('确定要删除分组 "' + groupName + '" 吗？此操作不可撤销。')) {
+          return;
+        }
+        try {
+          const resp = await fetch("/api/group?group=" + encodeURIComponent(groupName), {
+            method: "DELETE",
+            headers: { Authorization: "Bearer " + ACCESS_TOKEN },
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "删除失败");
+          showMessage("upload-message", "success", "分组已删除");
+          loadGroups();
+        } catch (err) {
+          showMessage("upload-message", "error", getErrorMessage(err));
+        }
       }
 
       async function loadGroups() {
@@ -943,6 +1024,7 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
             const rawGroup = escapeHtml(g.group);
             const topColo = escapeHtml(g.topColo || "-");
             const editButton = '<button class="group-btn js-edit-group" type="button" data-group="' + rawGroup + '">编辑</button>';
+            const deleteButton = '<button class="danger-btn js-delete-group" type="button" data-group="' + rawGroup + '">删除</button>';
             return '<div class="group-item">' +
               '<div>' +
                 '<div><span class="group-name">' + groupLabel + '</span>' +
@@ -950,7 +1032,7 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
                 '</div>' +
                 '<div class="group-meta">' + g.count + ' 个 IP · ' + topColo + ' · ' + formatTime(g.updatedAt) + '</div>' +
               '</div>' +
-              '<div>' + editButton + '</div>' +
+              '<div style="display:flex;gap:8px;">' + editButton + deleteButton + '</div>' +
             '</div>';
           }).join("") + '</div>';
         } catch (err) {
@@ -977,7 +1059,7 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
           const results = parseCsv(text);
           if (results.length === 0) throw new Error("CSV 中没有有效数据");
 
-          openEditor(groupName, pickTop(results, 5));
+          openEditor(groupName, pickTop(results, CSV_TOP_N));
           showMessage("upload-message", "success", "CSV 已解析，请确认后点击“保存分组”");
           fileInput.value = "";
         } catch (err) {
@@ -990,12 +1072,34 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
 
       document.getElementById("groups-container").addEventListener("click", handleGroupsContainerClick);
 
+      async function deleteTenantWithConfirm() {
+        if (!confirm("确定要移除本订阅地址的全部记录吗？将删除所有分组与配置，无法恢复。\\n\\n请再次确认。")) {
+          return;
+        }
+        if (!confirm("最后确认：移除该订阅地址记录？")) {
+          return;
+        }
+        try {
+          const resp = await fetch("/api/tenant", {
+            method: "DELETE",
+            headers: { Authorization: "Bearer " + ACCESS_TOKEN },
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "删除失败");
+          alert("订阅地址记录已移除，将返回首页");
+          window.location.href = "/";
+        } catch (err) {
+          alert("删除失败: " + getErrorMessage(err));
+        }
+      }
+
       window.addEmptyRow = addEmptyRow;
       window.removeRow = removeRow;
       window.cancelEdit = cancelEdit;
       window.saveEditedGroup = saveEditedGroup;
       window.loadGroupForEdit = loadGroupForEdit;
       window.startManualEdit = startManualEdit;
+      window.deleteTenantWithConfirm = deleteTenantWithConfirm;
 
       loadGroups();
     </script>
@@ -1019,7 +1123,29 @@ async function serveDashboard(request: Request, env: Env, tenantId: string): Pro
   }
 
   const origin = new URL(request.url).origin;
-  return html(dashboardPage(origin, tenantId, token, tenant.originSubscriptionUrl));
+  return html(dashboardPage(origin, tenantId, token, tenant.originSubscriptionUrl, tenant.topN ?? 5));
+}
+
+async function deleteTenant(request: Request, env: Env): Promise<Response> {
+  const token = parseBearerToken(request);
+  const tenantId = extractTenantIdFromToken(token);
+  const tenant = await requireTenant(env, tenantId);
+
+  if (tenant.accessToken !== token) {
+    return errorResponse(401, "访问令牌无效");
+  }
+
+  const reports = await loadReports(env, tenantId);
+  await Promise.all(
+    reports.map((r) => env.REPORTS.delete(getReportKey(tenantId, r.ssid)))
+  );
+
+  await Promise.all([
+    env.TENANTS.delete(getTenantKey(tenantId)),
+    env.TENANTS.delete(getOriginHashKey(tenant.originUrlHash)),
+  ]);
+
+  return json({ ok: true, tenantId });
 }
 
 export default {
@@ -1051,6 +1177,14 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/group") {
         return await getGroupReport(request, env);
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/api/group") {
+        return await deleteGroup(request, env);
+      }
+
+      if (request.method === "DELETE" && url.pathname === "/api/tenant") {
+        return await deleteTenant(request, env);
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/dashboard/")) {
