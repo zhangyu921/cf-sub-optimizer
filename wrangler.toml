@@ -12,3 +12,7 @@ preview_id = "3d4bd9c9ca564e13b47847497411c537"
 binding = "REPORTS"
 id = "ad63ad8749ba42e69bd968d50b0333c9"
 preview_id = "14ce702c41b447c0b44f58924b128cc4"
+
+[[routes]]
+pattern = "cf-sub-optimizer.basilfield.com"
+custom_domain = true
