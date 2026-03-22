@@ -174,7 +174,7 @@ async function migrateTenantOriginHash(
 async function fetchOriginSubscriptionTemplate(originSubscriptionUrl: string): Promise<OriginNodeTemplate> {
   const response = await fetch(originSubscriptionUrl, {
     headers: {
-      "user-agent": "cf-ip-choose/0.1",
+      "user-agent": "cf-sub-optimizer/0.1",
     },
   });
 

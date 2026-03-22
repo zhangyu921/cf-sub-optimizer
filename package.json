@@ -1,7 +1,7 @@
 {
-  "name": "cf-ip-choose",
+  "name": "cf-sub-optimizer",
   "version": "1.0.0",
-  "description": "Multi-tenant Cloudflare IP choose service skeleton",
+  "description": "Multi-tenant Cloudflare subscription optimizer for proxy providers",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

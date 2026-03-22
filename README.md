@@ -1,4 +1,4 @@
-# cf-ip-choose
+# cf-sub-optimizer
 
 一个基于 Cloudflare Worker 的多租户 Cloudflare IP 优选订阅服务。
 
