@@ -9,7 +9,7 @@ import type {
   SsidReport,
   TenantRecord,
 } from "../shared/types.js";
-import { buildSubscriptionLines, encodeSubscription, extractFirstVlessTemplate } from "../shared/vless.js";
+import { buildSubscriptionLines, encodeSubscription, extractFirstVlessTemplate, parseVlessUrl } from "../shared/vless.js";
 
 export interface Env {
   TENANTS: KVNamespace;
@@ -97,10 +97,18 @@ async function hashUrl(url: string): Promise<string> {
 }
 
 function normalizeOriginSubscriptionUrl(input: string, options?: { preserveHash?: boolean }): string {
-  const url = new URL(input);
+  const url = new URL(input.trim());
+
+  if (url.protocol === "vless:") {
+    if (!options?.preserveHash) {
+      url.hash = "";
+    }
+    return url.toString();
+  }
+
   const isLocalhost = url.hostname === "localhost" || url.hostname === "127.0.0.1";
   if (url.protocol !== "https:" && !isLocalhost) {
-    throw new Error("订阅链接必须使用 https");
+    throw new Error("订阅链接必须使用 https，或直接提供 vless:// 节点链接");
   }
   if (!options?.preserveHash) {
     url.hash = "";
@@ -172,6 +180,10 @@ async function migrateTenantOriginHash(
 }
 
 async function fetchOriginSubscriptionTemplate(originSubscriptionUrl: string): Promise<OriginNodeTemplate> {
+  if (originSubscriptionUrl.startsWith("vless://")) {
+    return parseVlessUrl(originSubscriptionUrl);
+  }
+
   const response = await fetch(originSubscriptionUrl, {
     headers: {
       "user-agent": "cf-sub-optimizer/0.1",
@@ -261,7 +273,7 @@ async function lookupOrCreateTenant(
 
     const tenant = await getTenant(env, parsed.tenantId);
     if (!tenant) {
-      throw new Error("找不到对应的配置，请使用原始订阅链接重新创建");
+      throw new Error("找不到对应的配置，请使用原始 https 订阅链接或 vless:// 节点链接重新创建");
     }
 
     if (tenant.accessToken !== parsed.token) {
@@ -497,11 +509,11 @@ function landingPage(): string {
     <p class="subtitle">Cloudflare IP 优选服务</p>
     <div class="card">
       <form id="lookup-form">
-        <label for="url">粘贴你的订阅链接</label>
-        <input id="url" name="url" type="url" placeholder="https://example.com/sub/xxx" required />
+        <label for="url">粘贴你的订阅链接或 VLESS 单节点链接</label>
+        <input id="url" name="url" type="text" placeholder="https://example.com/sub/xxx 或 vless://uuid@host:443?..." required />
         <button type="submit" id="submit-btn">进入管理</button>
       </form>
-      <p class="hint">支持：原始订阅链接 或 本站生成的优选订阅链接</p>
+      <p class="hint">支持：原始 https 订阅链接、单条 vless:// 节点链接，或本站生成的优选订阅链接</p>
       <p class="error" id="error" style="display:none;"></p>
     </div>
     <script>
@@ -611,12 +623,12 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
     <p class="subtitle">管理你的 Cloudflare IP 优选配置</p>
 
     <div class="section">
-      <div class="section-title">原始订阅链接</div>
+      <div class="section-title">原始订阅/节点地址</div>
       <div class="url-box">
         <input type="text" class="url-input" id="origin-sub-url" value="${originSubscriptionUrl}" readonly />
         <button class="copy-btn" onclick="copyUrl('origin-sub-url')">复制</button>
       </div>
-      <p style="font-size:13px;color:#888;margin-top:8px;">这是当前 tenant 绑定的源订阅地址，用于定位和重新拉取节点模板</p>
+      <p style="font-size:13px;color:#888;margin-top:8px;">这是当前 tenant 绑定的源地址，可以是 https 订阅链接或 vless:// 单节点链接，用于定位和生成节点模板</p>
     </div>
 
     <div class="section">
@@ -904,6 +916,14 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
         }
       }
 
+      function handleGroupsContainerClick(event) {
+        const target = event.target.closest(".js-edit-group");
+        if (!target) return;
+        const groupName = target.dataset.group || "";
+        if (!groupName) return;
+        loadGroupForEdit(groupName);
+      }
+
       async function loadGroups() {
         const container = document.getElementById("groups-container");
         try {
@@ -922,7 +942,7 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
             const groupLabel = escapeHtml(g.alias || g.group);
             const rawGroup = escapeHtml(g.group);
             const topColo = escapeHtml(g.topColo || "-");
-            const editButton = '<button class="group-btn" type="button" onclick="loadGroupForEdit(' + JSON.stringify(g.group) + ')">编辑</button>';
+            const editButton = '<button class="group-btn js-edit-group" type="button" data-group="' + rawGroup + '">编辑</button>';
             return '<div class="group-item">' +
               '<div>' +
                 '<div><span class="group-name">' + groupLabel + '</span>' +
@@ -967,6 +987,8 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string, or
           btn.textContent = "导入 CSV";
         }
       });
+
+      document.getElementById("groups-container").addEventListener("click", handleGroupsContainerClick);
 
       window.addEmptyRow = addEmptyRow;
       window.removeRow = removeRow;
