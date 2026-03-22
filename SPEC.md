@@ -12,7 +12,7 @@
 - 每个 IP 条目可选填写名字；未填写时默认使用 IP 本身
 - 服务端基于这些条目生成更适合该用户当前网络环境的订阅内容
 
-第一版目标是支持 `Hiddify` 使用。
+代理订阅为 **标准 base64 编码的多行 `vless://` 文本**；凡支持导入该类订阅的客户端均可使用。文档与自测中常以 `Hiddify` 为例，并非仅限该客户端。
 
 ## 2. Scope
 
@@ -326,6 +326,29 @@ Authorization: Bearer <accessToken>
 
 返回当前租户已保存的分组列表及其摘要信息，供管理页面展示。
 
+### `GET /api/group`
+
+查询单个分组详情。
+
+参数（query）：
+
+- `group=<groupKey>`（与存储用的分组键一致，请求体里历史字段名为 `ssid`）
+
+Header：`Authorization: Bearer <accessToken>`
+
+### `DELETE /api/group`
+
+删除指定分组及其条目；若租户 `aliases` 中存在该分组键，一并移除。
+
+参数（query）：`group=<groupKey>`  
+Header：`Authorization: Bearer <accessToken>`
+
+### `DELETE /api/tenant`
+
+删除当前租户：清空其全部分组报告、租户记录及 `originUrlHash` 映射（不可恢复）。
+
+Header：`Authorization: Bearer <accessToken>`
+
 ### `GET /sub/:tenantId`
 
 返回该租户的代理订阅。
@@ -412,7 +435,7 @@ SPEC.md
 
 - 管理页面支持手动新增、编辑、删除条目
 - Worker 能按分组键聚合结果
-- 代理订阅可被 `Hiddify` 导入并使用
+- 代理订阅可被常见客户端（如 `Hiddify`）导入并使用
 
 ## 13. Success Criteria
 
@@ -421,5 +444,5 @@ SPEC.md
 - 用户提交原始订阅 URL 后，拿到新的代理订阅 URL 和管理链接
 - 用户可以通过管理页面上传 CSV 或手动维护 IP 列表
 - 服务端能记录当前分组的最新条目集合
-- Hiddify 导入代理订阅 URL 后，能看到按分组名/alias 和条目名生成的多个节点
+- 兼容的客户端导入代理订阅 URL 后，能看到按分组名/alias 和条目名生成的多个节点
 - 节点基于原始模板，仅替换为对应的 `Cloudflare IP`
