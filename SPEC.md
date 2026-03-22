@@ -30,7 +30,6 @@
 
 ### Out of Scope
 
-- 本地 Agent / CLI 测速流程
 - 纯 Web 页面直接测速
 - 多协议全兼容
 - 多探针合并
