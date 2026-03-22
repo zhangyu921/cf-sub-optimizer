@@ -96,11 +96,14 @@ async function hashUrl(url: string): Promise<string> {
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function normalizeOriginSubscriptionUrl(input: string): string {
+function normalizeOriginSubscriptionUrl(input: string, options?: { preserveHash?: boolean }): string {
   const url = new URL(input);
   const isLocalhost = url.hostname === "localhost" || url.hostname === "127.0.0.1";
   if (url.protocol !== "https:" && !isLocalhost) {
     throw new Error("订阅链接必须使用 https");
+  }
+  if (!options?.preserveHash) {
+    url.hash = "";
   }
   return url.toString();
 }
@@ -142,6 +145,30 @@ async function requireTenant(env: Env, tenantId: string): Promise<TenantRecord> 
 
 async function getTenantByOriginHash(env: Env, hash: string): Promise<string | null> {
   return env.TENANTS.get(getOriginHashKey(hash));
+}
+
+async function migrateTenantOriginHash(
+  env: Env,
+  tenant: TenantRecord,
+  normalizedUrl: string,
+  normalizedHash: string,
+): Promise<TenantRecord> {
+  if (tenant.originUrlHash === normalizedHash && tenant.originSubscriptionUrl === normalizedUrl) {
+    return tenant;
+  }
+
+  const migrated: TenantRecord = {
+    ...tenant,
+    originSubscriptionUrl: normalizedUrl,
+    originUrlHash: normalizedHash,
+  };
+
+  await Promise.all([
+    env.TENANTS.put(getTenantKey(tenant.tenantId), JSON.stringify(migrated)),
+    env.TENANTS.put(getOriginHashKey(normalizedHash), tenant.tenantId),
+  ]);
+
+  return migrated;
 }
 
 async function fetchOriginSubscriptionTemplate(originSubscriptionUrl: string): Promise<OriginNodeTemplate> {
@@ -186,7 +213,7 @@ function parseOurSubscriptionUrl(inputUrl: string): { tenantId: string; token: s
 async function createNewTenant(
   env: Env,
   originSubscriptionUrl: string,
-  origin: string,
+  _origin: string,
 ): Promise<{ tenant: TenantRecord; isNew: true }> {
   const normalizedUrl = normalizeOriginSubscriptionUrl(originSubscriptionUrl);
   const originNodeTemplate = await fetchOriginSubscriptionTemplate(normalizedUrl);
@@ -250,7 +277,27 @@ async function lookupOrCreateTenant(
 
   const normalizedUrl = normalizeOriginSubscriptionUrl(inputUrl);
   const urlHash = await hashUrl(normalizedUrl);
-  const existingTenantId = await getTenantByOriginHash(env, urlHash);
+  let existingTenantId = await getTenantByOriginHash(env, urlHash);
+
+  if (!existingTenantId) {
+    const legacyUrl = normalizeOriginSubscriptionUrl(inputUrl, { preserveHash: true });
+    if (legacyUrl !== normalizedUrl) {
+      const legacyHash = await hashUrl(legacyUrl);
+      existingTenantId = await getTenantByOriginHash(env, legacyHash);
+
+      if (existingTenantId) {
+        const legacyTenant = await getTenant(env, existingTenantId);
+        if (legacyTenant) {
+          const migratedTenant = await migrateTenantOriginHash(env, legacyTenant, normalizedUrl, urlHash);
+          return {
+            tenantId: migratedTenant.tenantId,
+            accessToken: migratedTenant.accessToken,
+            isNew: false,
+          };
+        }
+      }
+    }
+  }
 
   if (existingTenantId) {
     const tenant = await getTenant(env, existingTenantId);
@@ -287,6 +334,28 @@ async function createTenantRecord(
   };
 }
 
+function normalizeReportResults(results: ReportPayload["results"]): SsidReport["results"] {
+  const normalized: SsidReport["results"] = [];
+
+  for (const item of results) {
+    const ip = item.ip?.trim();
+    if (!ip) {
+      continue;
+    }
+
+    normalized.push({
+      ip,
+      name: item.name?.trim() || undefined,
+      latency: item.latency,
+      loss: item.loss,
+      speed: item.speed,
+      colo: item.colo?.trim() || undefined,
+    });
+  }
+
+  return normalized;
+}
+
 async function saveReport(request: Request, env: Env): Promise<Response> {
   const token = parseBearerToken(request);
   const tenantId = extractTenantIdFromToken(token);
@@ -301,11 +370,16 @@ async function saveReport(request: Request, env: Env): Promise<Response> {
     return errorResponse(400, "分组名 (ssid) 不能为空");
   }
 
+  const normalizedResults = normalizeReportResults(body.results ?? []);
+  if (normalizedResults.length === 0) {
+    return errorResponse(400, "至少需要一个有效 IP");
+  }
+
   const report: SsidReport = {
     ssid: body.ssid.trim(),
     alias: body.alias?.trim() || tenant.aliases[body.ssid.trim()],
     updatedAt: body.updatedAt || new Date().toISOString(),
-    results: body.results.slice(0, tenant.topN),
+    results: normalizedResults,
   };
 
   await env.REPORTS.put(getReportKey(tenantId, report.ssid), JSON.stringify(report));
@@ -352,6 +426,28 @@ async function getGroups(request: Request, env: Env): Promise<Response> {
   }));
 
   return json({ groups });
+}
+
+async function getGroupReport(request: Request, env: Env): Promise<Response> {
+  const token = parseBearerToken(request);
+  const tenantId = extractTenantIdFromToken(token);
+  const tenant = await requireTenant(env, tenantId);
+
+  if (tenant.accessToken !== token) {
+    return errorResponse(401, "访问令牌无效");
+  }
+
+  const group = new URL(request.url).searchParams.get("group")?.trim();
+  if (!group) {
+    return errorResponse(400, "缺少分组名");
+  }
+
+  const report = await env.REPORTS.get<SsidReport>(getReportKey(tenantId, group), "json");
+  if (!report) {
+    return errorResponse(404, "找不到对应分组");
+  }
+
+  return json({ report });
 }
 
 async function getProxySubscription(request: Request, env: Env, tenantId: string): Promise<Response> {
@@ -432,7 +528,8 @@ function landingPage(): string {
           }
           window.location.href = "/dashboard/" + data.tenantId + "?token=" + data.accessToken;
         } catch (err) {
-          errorEl.textContent = err.message;
+          const message = err instanceof Error ? err.message : String(err);
+          errorEl.textContent = message;
           errorEl.style.display = "block";
           submitBtn.disabled = false;
           submitBtn.textContent = "进入管理";
@@ -443,7 +540,7 @@ function landingPage(): string {
 </html>`;
 }
 
-function dashboardPage(origin: string, tenantId: string, accessToken: string): string {
+function dashboardPage(origin: string, tenantId: string, accessToken: string, originSubscriptionUrl: string): string {
   const subscriptionUrl = `${origin}/sub/${tenantId}?token=${accessToken}`;
   const dashboardUrl = `${origin}/dashboard/${tenantId}?token=${accessToken}`;
 
@@ -456,7 +553,7 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string): s
     <style>
       :root { color-scheme: light dark; }
       * { box-sizing: border-box; }
-      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; line-height: 1.6; }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 960px; margin: 40px auto; padding: 0 20px; line-height: 1.6; }
       h1 { margin-bottom: 8px; }
       .subtitle { color: #666; margin-bottom: 32px; }
       .section { border: 1px solid #ddd; border-radius: 12px; padding: 20px; margin-bottom: 20px; background: #fafafa; }
@@ -464,20 +561,26 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string): s
       .section-title { font-weight: 600; margin-bottom: 12px; }
       .url-box { display: flex; gap: 8px; }
       .url-input { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; font-family: monospace; }
-      @media (prefers-color-scheme: dark) { .url-input { background: #222; border-color: #444; color: #fff; } }
-      .copy-btn { padding: 10px 16px; background: #0070f3; color: white; border: none; border-radius: 6px; cursor: pointer; white-space: nowrap; }
+      .copy-btn, .secondary-btn, .danger-btn, .upload-btn, .group-btn { padding: 10px 16px; color: white; border: none; border-radius: 6px; cursor: pointer; white-space: nowrap; }
+      .copy-btn { background: #0070f3; }
       .copy-btn:hover { background: #0060df; }
+      .upload-btn { background: #10b981; }
+      .upload-btn:hover { background: #059669; }
+      .secondary-btn { background: #6b7280; }
+      .secondary-btn:hover { background: #4b5563; }
+      .danger-btn { background: #dc2626; }
+      .danger-btn:hover { background: #b91c1c; }
+      .group-btn { background: #2563eb; }
+      .group-btn:hover { background: #1d4ed8; }
+      .copy-btn:disabled, .secondary-btn:disabled, .danger-btn:disabled, .upload-btn:disabled, .group-btn:disabled { background: #999; cursor: not-allowed; }
       .upload-form { display: grid; gap: 12px; }
       .form-row { display: flex; gap: 12px; align-items: end; }
       .form-group { flex: 1; }
       .form-group label { display: block; margin-bottom: 6px; font-size: 14px; }
-      .form-group input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; }
-      @media (prefers-color-scheme: dark) { .form-group input { background: #222; border-color: #444; color: #fff; } }
-      .upload-btn { padding: 10px 20px; background: #10b981; color: white; border: none; border-radius: 6px; cursor: pointer; }
-      .upload-btn:hover { background: #059669; }
-      .upload-btn:disabled { background: #999; cursor: not-allowed; }
+      .form-group input, .table-input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; }
+      @media (prefers-color-scheme: dark) { .url-input, .form-group input, .table-input { background: #222; border-color: #444; color: #fff; } }
       .groups-list { margin-top: 12px; }
-      .group-item { display: flex; justify-content: space-between; padding: 12px; border-bottom: 1px solid #eee; }
+      .group-item { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px; border-bottom: 1px solid #eee; }
       @media (prefers-color-scheme: dark) { .group-item { border-color: #333; } }
       .group-item:last-child { border-bottom: none; }
       .group-name { font-weight: 500; }
@@ -486,18 +589,35 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string): s
       .message { padding: 12px; border-radius: 6px; margin-top: 12px; }
       .message.success { background: #d1fae5; color: #065f46; }
       .message.error { background: #fee2e2; color: #991b1b; }
-      @media (prefers-color-scheme: dark) { 
+      @media (prefers-color-scheme: dark) {
         .message.success { background: #064e3b; color: #6ee7b7; }
         .message.error { background: #7f1d1d; color: #fca5a5; }
       }
       .back-link { display: inline-block; margin-bottom: 20px; color: #0070f3; text-decoration: none; }
       .back-link:hover { text-decoration: underline; }
+      .edit-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
+      .edit-grid { overflow-x: auto; }
+      .edit-table { width: 100%; border-collapse: collapse; }
+      .edit-table th, .edit-table td { padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; }
+      @media (prefers-color-scheme: dark) { .edit-table th, .edit-table td { border-color: #333; } }
+      .table-hint { color: #888; font-size: 13px; margin-bottom: 12px; }
+      .edit-actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+      .hidden { display: none; }
     </style>
   </head>
   <body>
     <a href="/" class="back-link">← 返回首页</a>
     <h1>管理面板</h1>
     <p class="subtitle">管理你的 Cloudflare IP 优选配置</p>
+
+    <div class="section">
+      <div class="section-title">原始订阅链接</div>
+      <div class="url-box">
+        <input type="text" class="url-input" id="origin-sub-url" value="${originSubscriptionUrl}" readonly />
+        <button class="copy-btn" onclick="copyUrl('origin-sub-url')">复制</button>
+      </div>
+      <p style="font-size:13px;color:#888;margin-top:8px;">这是当前 tenant 绑定的源订阅地址，用于定位和重新拉取节点模板</p>
+    </div>
 
     <div class="section">
       <div class="section-title">优选订阅链接</div>
@@ -518,7 +638,7 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string): s
     </div>
 
     <div class="section">
-      <div class="section-title">上传测速结果</div>
+      <div class="section-title">导入 CSV 或手动编辑</div>
       <form class="upload-form" id="upload-form">
         <div class="form-row">
           <div class="form-group">
@@ -527,48 +647,93 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string): s
           </div>
           <div class="form-group">
             <label for="csv-file">CSV 文件</label>
-            <input type="file" id="csv-file" accept=".csv" required />
+            <input type="file" id="csv-file" accept=".csv" />
           </div>
-          <button type="submit" class="upload-btn" id="upload-btn">上传</button>
+          <button type="submit" class="upload-btn" id="upload-btn">导入 CSV</button>
+          <button type="button" class="secondary-btn" id="manual-btn" onclick="startManualEdit()">手动开始</button>
         </div>
       </form>
       <div id="upload-message"></div>
     </div>
 
+    <div class="section hidden" id="edit-section">
+      <div class="edit-header">
+        <div>
+          <div class="section-title">编辑分组条目</div>
+          <div class="table-hint">CSV 导入后可修改名字，也可手动新增、删除条目。保存后订阅会按“分组前缀-名字或 IP”生成节点名。</div>
+        </div>
+        <div><strong id="editing-group-label"></strong></div>
+      </div>
+      <div class="edit-grid">
+        <table class="edit-table">
+          <thead>
+            <tr>
+              <th style="width:38%;">IP</th>
+              <th style="width:38%;">名字（可选）</th>
+              <th style="width:24%;">操作</th>
+            </tr>
+          </thead>
+          <tbody id="edit-tbody"></tbody>
+        </table>
+      </div>
+      <div class="edit-actions">
+        <button class="secondary-btn" type="button" onclick="addEmptyRow()">新增条目</button>
+        <button class="upload-btn" type="button" id="save-btn" onclick="saveEditedGroup()">保存分组</button>
+        <button class="secondary-btn" type="button" onclick="cancelEdit()">取消</button>
+      </div>
+      <div id="edit-message"></div>
+    </div>
+
     <div class="section">
-      <div class="section-title">已上传分组</div>
+      <div class="section-title">已保存分组</div>
       <div id="groups-container">
         <div class="empty">加载中...</div>
       </div>
     </div>
 
     <script>
-      const ACCESS_TOKEN = "${accessToken}";
-      const TENANT_ID = "${tenantId}";
+      const ACCESS_TOKEN = ${JSON.stringify(accessToken)};
+      let currentEditGroup = "";
+      let currentEditItems = [];
+
+      function getErrorMessage(err) {
+        if (err && typeof err === "object" && "message" in err && typeof err.message === "string") {
+          return err.message;
+        }
+        return String(err || "未知错误");
+      }
 
       function copyUrl(id) {
         const input = document.getElementById(id);
         navigator.clipboard.writeText(input.value);
         const btn = input.nextElementSibling;
         btn.textContent = "已复制";
-        setTimeout(() => btn.textContent = "复制", 1500);
+        setTimeout(() => {
+          btn.textContent = "复制";
+        }, 1500);
       }
 
       function parseNumber(val) {
         const n = Number(val);
-        return Number.isFinite(n) ? n : 0;
+        return Number.isFinite(n) ? n : undefined;
       }
 
       function parseCsv(text) {
-        const lines = text.split(/\\r?\\n/).map(l => l.trim()).filter(Boolean);
+        const lines = text.split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);
         if (lines.length <= 1) return [];
-        return lines.slice(1).map(line => {
+        return lines.slice(1).map((line) => {
           const [ip, , , loss, latency, speed, colo] = line.split(",");
-          return { ip, loss: parseNumber(loss), latency: parseNumber(latency), speed: parseNumber(speed), colo: colo || undefined };
-        }).filter(r => r.ip);
+          return {
+            ip: (ip || "").trim(),
+            loss: parseNumber(loss),
+            latency: parseNumber(latency),
+            speed: parseNumber(speed),
+            colo: colo || undefined,
+          };
+        }).filter((r) => r.ip);
       }
 
-      function pickTop(results, n = 5) {
+      function pickTop(results, n) {
         return results.slice(0, n);
       }
 
@@ -582,45 +747,209 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string): s
         return Math.floor(diff / 86400000) + " 天前";
       }
 
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+
+      function showMessage(targetId, type, message) {
+        const el = document.getElementById(targetId);
+        el.innerHTML = '<div class="message ' + type + '">' + escapeHtml(message) + '</div>';
+      }
+
+      function clearMessage(targetId) {
+        document.getElementById(targetId).innerHTML = "";
+      }
+
+      function renderEditTable() {
+        const tbody = document.getElementById("edit-tbody");
+        if (currentEditItems.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="3" class="empty">暂无条目，请新增至少一个 IP</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = currentEditItems.map((item, index) => {
+          const ip = escapeHtml(item.ip || "");
+          const name = escapeHtml(item.name || "");
+          return '<tr>' +
+            '<td><input class="table-input" data-field="ip" data-index="' + index + '" value="' + ip + '" placeholder="104.16.1.1" /></td>' +
+            '<td><input class="table-input" data-field="name" data-index="' + index + '" value="' + name + '" placeholder="不填则默认使用 IP" /></td>' +
+            '<td><button class="danger-btn" type="button" onclick="removeRow(' + index + ')">删除</button></td>' +
+          '</tr>';
+        }).join("");
+      }
+
+      function openEditor(groupName, items) {
+        currentEditGroup = groupName;
+        currentEditItems = items.map((item) => ({ ...item }));
+        document.getElementById("editing-group-label").textContent = "分组：" + groupName;
+        document.getElementById("edit-section").classList.remove("hidden");
+        clearMessage("edit-message");
+        renderEditTable();
+        document.getElementById("edit-section").scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+
+      function syncItemsFromInputs() {
+        const next = currentEditItems.map((item) => ({ ...item }));
+        document.querySelectorAll("#edit-tbody input[data-field]").forEach((input) => {
+          const index = Number(input.dataset.index);
+          const field = input.dataset.field;
+          if (!Number.isInteger(index) || !next[index] || !field) return;
+          next[index][field] = input.value.trim();
+        });
+        currentEditItems = next;
+      }
+
+      function addEmptyRow() {
+        syncItemsFromInputs();
+        currentEditItems.push({ ip: "", name: "" });
+        renderEditTable();
+      }
+
+      function removeRow(index) {
+        syncItemsFromInputs();
+        currentEditItems.splice(index, 1);
+        renderEditTable();
+      }
+
+      function cancelEdit() {
+        currentEditGroup = "";
+        currentEditItems = [];
+        document.getElementById("edit-section").classList.add("hidden");
+        clearMessage("edit-message");
+      }
+
+      function startManualEdit() {
+        clearMessage("upload-message");
+        const groupName = document.getElementById("group-name").value.trim();
+        if (!groupName) {
+          showMessage("upload-message", "error", "请输入分组名");
+          return;
+        }
+        openEditor(groupName, [{ ip: "", name: "" }]);
+      }
+
+      async function loadGroupForEdit(groupName) {
+        clearMessage("upload-message");
+        try {
+          const resp = await fetch("/api/group?group=" + encodeURIComponent(groupName), {
+            headers: { Authorization: "Bearer " + ACCESS_TOKEN },
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "加载分组失败");
+          openEditor(data.report.ssid, data.report.results || []);
+        } catch (err) {
+          showMessage("upload-message", "error", getErrorMessage(err));
+        }
+      }
+
+      async function saveEditedGroup() {
+        syncItemsFromInputs();
+        const saveBtn = document.getElementById("save-btn");
+        saveBtn.disabled = true;
+        saveBtn.textContent = "保存中...";
+        clearMessage("edit-message");
+
+        try {
+          if (!currentEditGroup) throw new Error("缺少分组名");
+          const cleaned = currentEditItems
+            .map((item) => ({
+              ...item,
+              ip: (item.ip || "").trim(),
+              name: (item.name || "").trim(),
+            }))
+            .filter((item) => item.ip);
+
+          if (cleaned.length === 0) {
+            throw new Error("请至少保留一个有效 IP");
+          }
+
+          const payload = {
+            ssid: currentEditGroup,
+            updatedAt: new Date().toISOString(),
+            results: cleaned.map((item) => {
+              const next = { ip: item.ip };
+              if (item.name) next.name = item.name;
+              if (item.latency !== undefined) next.latency = item.latency;
+              if (item.loss !== undefined) next.loss = item.loss;
+              if (item.speed !== undefined) next.speed = item.speed;
+              if (item.colo) next.colo = item.colo;
+              return next;
+            }),
+          };
+
+          const resp = await fetch("/api/report", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: "Bearer " + ACCESS_TOKEN,
+            },
+            body: JSON.stringify(payload),
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "保存失败");
+
+          showMessage("edit-message", "success", "保存成功，已保存 " + data.count + " 个 IP");
+          document.getElementById("group-name").value = currentEditGroup;
+          loadGroups();
+        } catch (err) {
+          showMessage("edit-message", "error", getErrorMessage(err));
+        } finally {
+          saveBtn.disabled = false;
+          saveBtn.textContent = "保存分组";
+        }
+      }
+
       async function loadGroups() {
         const container = document.getElementById("groups-container");
         try {
           const resp = await fetch("/api/groups", {
-            headers: { "Authorization": "Bearer " + ACCESS_TOKEN }
+            headers: { Authorization: "Bearer " + ACCESS_TOKEN },
           });
           const data = await resp.json();
-          if (!resp.ok) throw new Error(data.error);
-          
+          if (!resp.ok) throw new Error(data.error || "加载失败");
+
           if (!data.groups || data.groups.length === 0) {
-            container.innerHTML = '<div class="empty">暂无分组，请上传测速结果</div>';
+            container.innerHTML = '<div class="empty">暂无分组，请导入 CSV 或手动新增条目</div>';
             return;
           }
 
-          container.innerHTML = '<div class="groups-list">' + data.groups.map(g => 
-            '<div class="group-item">' +
-              '<div><span class="group-name">' + (g.alias || g.group) + '</span>' +
-                (g.alias ? ' <span style="color:#888">(' + g.group + ')</span>' : '') +
+          container.innerHTML = '<div class="groups-list">' + data.groups.map((g) => {
+            const groupLabel = escapeHtml(g.alias || g.group);
+            const rawGroup = escapeHtml(g.group);
+            const topColo = escapeHtml(g.topColo || "-");
+            const editButton = '<button class="group-btn" type="button" onclick="loadGroupForEdit(' + JSON.stringify(g.group) + ')">编辑</button>';
+            return '<div class="group-item">' +
+              '<div>' +
+                '<div><span class="group-name">' + groupLabel + '</span>' +
+                (g.alias ? ' <span style="color:#888">(' + rawGroup + ')</span>' : '') +
+                '</div>' +
+                '<div class="group-meta">' + g.count + ' 个 IP · ' + topColo + ' · ' + formatTime(g.updatedAt) + '</div>' +
               '</div>' +
-              '<div class="group-meta">' + g.count + ' 个 IP · ' + (g.topColo || '-') + ' · ' + formatTime(g.updatedAt) + '</div>' +
-            '</div>'
-          ).join("") + '</div>';
+              '<div>' + editButton + '</div>' +
+            '</div>';
+          }).join("") + '</div>';
         } catch (err) {
-          container.innerHTML = '<div class="empty" style="color:#e00;">加载失败: ' + err.message + '</div>';
+          container.innerHTML = '<div class="empty" style="color:#e00;">加载失败: ' + escapeHtml(getErrorMessage(err)) + '</div>';
         }
       }
 
       document.getElementById("upload-form").addEventListener("submit", async (e) => {
         e.preventDefault();
         const btn = document.getElementById("upload-btn");
-        const msgEl = document.getElementById("upload-message");
         btn.disabled = true;
-        btn.textContent = "上传中...";
-        msgEl.innerHTML = "";
+        btn.textContent = "导入中...";
+        clearMessage("upload-message");
 
         try {
           const groupName = document.getElementById("group-name").value.trim();
-          const file = document.getElementById("csv-file").files[0];
-          
+          const fileInput = document.getElementById("csv-file");
+          const file = fileInput.files[0];
+
           if (!groupName) throw new Error("请输入分组名");
           if (!file) throw new Error("请选择 CSV 文件");
 
@@ -628,36 +957,23 @@ function dashboardPage(origin: string, tenantId: string, accessToken: string): s
           const results = parseCsv(text);
           if (results.length === 0) throw new Error("CSV 中没有有效数据");
 
-          const topResults = pickTop(results, 5);
-          const payload = {
-            ssid: groupName,
-            updatedAt: new Date().toISOString(),
-            results: topResults
-          };
-
-          const resp = await fetch("/api/report", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": "Bearer " + ACCESS_TOKEN
-            },
-            body: JSON.stringify(payload)
-          });
-
-          const data = await resp.json();
-          if (!resp.ok) throw new Error(data.error);
-
-          msgEl.innerHTML = '<div class="message success">上传成功！已保存 ' + data.count + ' 个 IP</div>';
-          document.getElementById("group-name").value = "";
-          document.getElementById("csv-file").value = "";
-          loadGroups();
+          openEditor(groupName, pickTop(results, 5));
+          showMessage("upload-message", "success", "CSV 已解析，请确认后点击“保存分组”");
+          fileInput.value = "";
         } catch (err) {
-          msgEl.innerHTML = '<div class="message error">' + err.message + '</div>';
+          showMessage("upload-message", "error", getErrorMessage(err));
         } finally {
           btn.disabled = false;
-          btn.textContent = "上传";
+          btn.textContent = "导入 CSV";
         }
       });
+
+      window.addEmptyRow = addEmptyRow;
+      window.removeRow = removeRow;
+      window.cancelEdit = cancelEdit;
+      window.saveEditedGroup = saveEditedGroup;
+      window.loadGroupForEdit = loadGroupForEdit;
+      window.startManualEdit = startManualEdit;
 
       loadGroups();
     </script>
@@ -681,7 +997,7 @@ async function serveDashboard(request: Request, env: Env, tenantId: string): Pro
   }
 
   const origin = new URL(request.url).origin;
-  return html(dashboardPage(origin, tenantId, token));
+  return html(dashboardPage(origin, tenantId, token, tenant.originSubscriptionUrl));
 }
 
 export default {
@@ -709,6 +1025,10 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/groups") {
         return await getGroups(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/group") {
+        return await getGroupReport(request, env);
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/dashboard/")) {

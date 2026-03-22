@@ -76,13 +76,11 @@ export function buildVlessUrl(template: OriginNodeTemplate, server: string, name
   return url.toString();
 }
 
-export function buildNodeName(report: SsidReport, rank: number, latency: number, colo?: string): string {
+export function buildNodeName(report: SsidReport, itemName?: string): string {
   const label = report.alias?.trim() || report.ssid.trim();
-  const rankString = String(rank).padStart(2, "0");
-  const coloLabel = colo?.trim() || "UNK";
-  const latencyLabel = Number.isFinite(latency) ? `${Math.round(latency)}ms` : "NA";
+  const displayName = itemName?.trim() || "IP";
 
-  return `${label}-${rankString}-${coloLabel}-${latencyLabel}`;
+  return `${label}-${displayName}`;
 }
 
 export function buildSubscriptionLines(
@@ -92,8 +90,9 @@ export function buildSubscriptionLines(
   const lines: string[] = [];
 
   for (const report of reports) {
-    report.results.forEach((result, index) => {
-      const name = buildNodeName(report, index + 1, result.latency, result.colo);
+    report.results.forEach((result) => {
+      const itemName = result.name?.trim() || result.ip;
+      const name = buildNodeName(report, itemName);
       lines.push(buildVlessUrl(template, result.ip, name));
     });
   }

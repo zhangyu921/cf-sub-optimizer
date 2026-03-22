@@ -1,8 +1,9 @@
 export interface SpeedTestResult {
   ip: string;
-  latency: number;
-  loss: number;
-  speed: number;
+  name?: string;
+  latency?: number;
+  loss?: number;
+  speed?: number;
   colo?: string;
 }
 
