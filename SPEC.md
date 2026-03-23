@@ -2,298 +2,195 @@
 
 ## 1. Goal
 
-构建一个多租户的 `Cloudflare IP choose` 服务：
+构建一个多租户的 Cloudflare IP 优选订阅服务：
 
-- 用户提供原始订阅 URL
-- 系统生成该用户专属的代理订阅 URL
-- 用户通过 Worker 提供的管理页面维护各分组的 IP 条目
-- 管理页面支持导入 `CloudflareSpeedTest` 结果 CSV 作为初始数据
-- 管理页面支持手动新增、编辑、删除 IP 条目
-- 每个 IP 条目可选填写名字；未填写时默认使用 IP 本身
-- 服务端基于这些条目生成更适合该用户当前网络环境的订阅内容
+- 用户提供**原始订阅 URL**（或本站生成的订阅链接），系统绑定租户并生成**专属代理订阅 URL** 与**管理链接**。
+- 用户通过 Worker 提供的**管理页面**（或 **HTTP API**）维护各分组下的 IP 条目。
+- 管理页支持上传 **CFST / mcis** 导出的 CSV 快速录入，也支持**全手动**编辑；其他来源可在表格中自行填写 IP 与名称。
+- 可选在订阅**末尾**合并 **Hostmonit** 公开优选 IP（第三方维护，与自建分组独立）。
+- 服务端基于条目与节点模板生成 **base64 编码的多行 `vless://` 文本**；凡支持该类订阅的客户端均可使用（文档常以 `Hiddify` 为例）。
 
-代理订阅为 **标准 base64 编码的多行 `vless://` 文本**；凡支持导入该类订阅的客户端均可使用。文档与自测中常以 `Hiddify` 为例，并非仅限该客户端。
+---
 
-## 2. Scope
+## 2. 推荐阅读顺序（为何调整）
+
+早期 SPEC 将 **API 细节**放在**用户如何操作**之前，对「先理解产品再对接实现」不够友好。当前结构约定为：
+
+1. **主路径**（本节 + §3）：谁做什么、订阅里有什么。
+2. **数据模型**（§4）：租户、分组、条目存什么。
+3. **订阅里长什么样**（§5）：Origin、自建节点、Hostmonit 的顺序与命名。
+4. **管理页与 CSV**（§6）：上传什么文件、如何解析、名字怎么来。
+5. **API**（§7）：程序化写入与设置；与页面「保存分组」等价的是 `POST /api/report`。
+
+实现细节（Worker、KV、`src/shared/cfst.ts`）在对应章节用简短指针标出即可。
+
+---
+
+## 3. Scope
 
 ### In Scope
 
-- 多租户
-- 每租户一个原始订阅 URL
-- 每租户一个代理订阅 URL
-- 管理页面导入 `CloudflareSpeedTest` CSV
-- 管理页面手动维护 IP 列表
-- 分组名 -> alias 映射
-- IP 条目的可选自定义名字
-- 服务端生成 base64 订阅
-- 节点模板基于原始订阅自动提取
+- 多租户；每租户一个原始订阅 URL、一个 access token、一个代理订阅 URL。
+- 分组（group key / `ssid`）与可选 **alias**；每组下多条 **IP 条目**（`ip`、可选 `name`、以及测速附带字段）。
+- 管理页：**CSV 导入**（[CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest)、[montecarlo-ip-searcher (mcis)](https://github.com/Leo-Mu/montecarlo-ip-searcher)）、**手动**增删改、**保存**到服务端。
+- **程序化**：`POST /api/report` 与页面保存等价；`PATCH /api/tenant/settings` 切换 Hostmonit 合并开关。
+- 订阅扩展：租户级开关 **合并 Hostmonit**（数据来自 `get_optimization_ip` API；公开页面参考 [Hostmonit CloudFlareYes](https://stock.hostmonit.com/CloudFlareYes)）。
+- 单协议场景：**VLESS + WS + TLS**，节点模板从原始订阅解析。
 
 ### Out of Scope
 
-- 纯 Web 页面直接测速
-- 多协议全兼容
-- 多探针合并
-- 历史结果分析面板
-- 通用公开优选池
+- 本站内嵌测速探针、多协议全兼容、多探针合并、历史分析面板、通用公开优选池（Hostmonit 仅为可选附加来源）。
 
-## 3. First Version Constraints
+### 第一版约束
 
-第一版仅支持：
+- CSV 导入是**批量录入**，解析结果与手动条目在保存前统一为同一结构。
+- 单租户至少能从原始订阅解析出一个有效 `vless://` 作为模板。
 
-- 单协议：`VLESS + WS + TLS`
-- 单类场景：`Cloudflare` 前置
-- 单一输入模型：管理页面维护分组下的 IP 条目
-- CSV 导入仅作为批量录入方式，不作为独立数据模型
-- 单租户模板来源：原始订阅中可解析出至少一个有效 `vless://` 节点
+---
 
 ## 4. Core Model
 
 ### Tenant
 
-每个租户包含：
+- `tenantId`、`originSubscriptionUrl`、`originNodeTemplate`、`accessToken`、`originUrlHash`
+- `aliases`：分组键 → 展示用 alias
+- `topN`：CSV 导入后进入编辑器时截取前 N 条（默认 5，上限与实现一致）
+- `subscriptionSources`：可选 `{ hostmonit?: boolean }`；未写入 KV 的旧租户视为全部关闭
 
-- `tenantId`
-- `originSubscriptionUrl`
-- `originNodeTemplate`
-- `accessToken`
-- `aliases`
-- `groupsByKey`
+当前实现：**同一 `accessToken`** 用于管理页、`/api/report`、订阅读取等（后续可演进读写分离）。
 
-说明：
+### Group Report（每组一条 KV）
 
-- 当前 worker 实现使用单一 `accessToken`，同时用于管理页面访问、保存分组条目和读取生成订阅。
-- 后续如需读写分离，可再演进为独立 token 模型。
-- `groupsByKey` 表示该租户下按分组键存储的最新条目集合。
+- `ssid`（分组键）、可选 `alias`、`updatedAt`
+- `results[]`：与下述条目结构一致
 
-### Group Record
+### Group Item（`SpeedTestResult`）
 
-每个分组包含：
+| 字段 | 说明 |
+|------|------|
+| `ip` | 必填（保存时）；订阅生成核心 |
+| `name` | 可选；节点展示名，空则回退 `ip` |
+| `latency` / `loss` / `speed` / `colo` | 可选；来自测速或 CSV，**不参与订阅连通性逻辑**，仅供展示或人工判断 |
 
-- `groupKey`
-- `alias`
-- `updatedAt`
-- `items`
-
-### Group Item
-
-每个条目包含：
-
-- `ip`
-- `name`（可选）
-- `source`（可选，示例：`csv` / `manual`）
-- `latency`（可选）
-- `loss`（可选）
-- `speed`（可选）
-- `colo`（可选）
-
-说明：
-
-- 订阅生成所必需的字段只有 `ip`。
-- `name` 用于节点显示名，未填写时默认回退到 `ip`。
-- `latency/loss/speed/colo` 主要用于 CSV 导入后的展示、排序或人工判断，不作为订阅生成的必填条件。
+说明：`loss` 在 **mcis 英文表头 CSV** 中仅当存在 **`loss` 列**时写入；不会用 `fail_prefix` 等字段冒充丢包率。
 
 ### Origin Node Template
 
-从原始订阅中提取固定字段：
+从原始订阅提取：`uuid`、`port`、`host`、`sni`、`path`、`security`、`type` 等；生成时用条目替换 **`server`** 与节点名。
 
-- `uuid`
-- `port`
-- `host`
-- `sni`
-- `path`
-- `security`
-- `type`
+---
 
-动态替换字段：
+## 5. Subscription Output
 
-- `server address`
-- `node name`
+### 输入侧
 
-## 5. Architecture
+- 原始订阅解析出的模板 + 各分组已保存条目 +（可选）Hostmonit 条目列表。
 
-### Dashboard UI
+### 输出行为
 
-由 Worker 提供管理页面。
+- 每个自建条目对应一条 `vless://`：保留模板参数，**仅将连接地址换为对应 IP**，名称按 §6.4 / 本节规则拼接。
+- **Hostmonit**：仅在租户开启 `subscriptionSources.hostmonit` 时，在订阅**末尾**追加由 Hostmonit API 解析出的节点（名称含地区与线路等，由 `src/shared/hostmonit.ts` 规则生成）。
+- 最终整体 **base64** 返回（与常见客户端导入格式一致）。
 
-职责：
+### 节点名（订阅中的最终串）
 
-- 展示租户的代理订阅 URL 和管理链接
-- 为指定分组导入 `CloudflareSpeedTest` CSV
-- 将 CSV 结果转换为可编辑的条目列表
-- 提供交互式表格，至少支持两列：`ip`、`name`
-- 允许用户手动新增、编辑、删除条目
-- 保存某个分组的最新条目集合
+建议形式：`{aliasOrGroup}-{itemNameOrIp}`
 
-说明：
+- 前缀：有 alias 用 alias，否则用分组键。
+- 后缀：条目 `name` 非空则用 `name`，否则用 `ip`。
 
-- CSV 导入后的结果不是最终提交态，用户可以继续修改。
-- 手动新增的条目与 CSV 导入的条目在保存前统一视为同一种数据结构。
+示例：`Home-东京(NRT)-01`、`Cafe-104.16.1.1`。
 
-### Backend Service
+---
 
-使用 `Cloudflare Worker`。
+## 6. 管理页：CSV、手动与扩展来源
 
-职责：
+### 6.1 主流程（与早期「Import CSV」条目对齐）
 
-- 接收管理页面提交的分组条目
-- 存储每个租户、每个分组的最新条目
-- 拉取并解析原始订阅
-- 生成代理订阅内容
-- 对外提供固定代理订阅 URL
+1. 用户持 `accessToken` 打开 `/dashboard/:tenantId?token=...`。
+2. **分组名**：输入分组键（新建或覆盖同名分组）。
+3. **录入方式三选一**：
+   - 上传 **CFST** 默认 `result.csv` 或 **mcis** 的 `--out csv` 文件；
+   - 点「手动开始」从空表填 IP；
+   - 外部脚本调用 `POST /api/report`（与点「保存分组」等价）。
+4. 导入 CSV 后进入**可编辑表格**，可改 IP/名称或增删行，再**保存**写入 KV。
 
-### Storage
+说明：CSV 解析在浏览器内完成（`dashboardPage` 内嵌脚本）；共享逻辑与 `src/shared/cfst.ts` **语义对齐**，便于以后抽到单测。
 
-第一版建议：
+### 6.2 官方对接的两种 CSV（面向用户说明）
 
-- `KV` 保存租户配置和各分组最新条目
+| 工具 | 参考仓库 | 使用要点 |
+|------|----------|----------|
+| **CloudflareSpeedTest（CFST）** | [XIU2/CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) | 默认生成的 `result.csv` 即可（首行中文表头，数据列顺序固定）。 |
+| **montecarlo-ip-searcher（mcis）** | [Leo-Mu/montecarlo-ip-searcher](https://github.com/Leo-Mu/montecarlo-ip-searcher) | 必须 **`--out csv`**，并用 **`--out-file`**（或等价参数）写出文件；否则默认可能是 text/jsonl。示例：`./mcis -v --out csv --out-file=result.csv --cidr-file ./ipv4cidr.txt --budget 3000 --concurrency 100` |
 
-## 6. Subscription Behavior
+**其他格式**：不在上述两种之列时，请用「手动开始」或在表格中直接填写 **IP** 与 **名称**。
 
-### Input
+### 6.3 解析策略（实现摘要）
 
-用户提供：
+解析入口：`parseCfstCsv`（`src/shared/cfst.ts`）与管理页 `parseCsv` 行为一致。
 
-- 原始订阅 URL
-- 一个或多个分组下的 IP 条目列表
+1. **按列名解析（Named）**  
+   当表头同时含 **`ip`**，且满足以下**任一**条件时走列名映射：
+   - 含 **`download_mbps`**，或
+   - 同时含 **`rank`** 与 **`score_ms`**，或
+   - 同时含 **`rank`** 与 **`prefix`**（典型 mcis 导出）。
 
-服务端解析出一个节点模板，例如：
+   并从列中读取：`ip`、`colo`、`download_mbps`（若无则用 `speed`）、可选 `line`（`CM`/`CU`/`CT`）、可选 `loss`（仅 `loss` 列）、`latency`（优先 `latency`，否则 `score_ms`、`total_ms`）。
 
-```text
-vless://uuid@example.com:443?encryption=none&host=example.com&path=%2Fbnramdon&security=tls&type=ws#name
-```
+2. **兜底**  
+   若表头含 **`ip`** 且**第二行数据**形如「首列纯数字 rank、第二列 IPv4/IPv6」，**强制**走按列名解析，避免误走固定列把 **rank 当成 IP**（历史问题）。
 
-### Output
+3. **固定列（Legacy）**  
+   首行任意表头，从**第二行**起数据列顺序为：  
+   `ip, (skip×2), loss, latency, speed, colo, line?`  
+   第 8 列可选运营商线路代码。与 **CFST `result.csv` 数据列**一致。
 
-服务端生成代理订阅：
+4. **固定列入口二次保险**  
+   即使误判进入 Legacy，若检测到 rank+IP 形态，会**改走** Named 解析。
 
-- 每个 IP 条目生成一条新的 `vless://`
-- 保留原模板的 `uuid/host/path/tls/ws`
-- 仅替换连接地址为对应 `Cloudflare IP`
-- 依据条目生成节点名字
-- 多条节点按行拼接
-- 最终整体做 `base64` 返回
+### 6.4 导入时自动生成的 `name`（表格中的「名字」列）
 
-### Node Name
+用于减少手工起名；保存后仍可与 §5 的分组前缀拼接成最终节点名。
 
-建议命名：
+- 有 **colo**：`地区中文(colo)·线路中文-序号`（线路列可选；无线路则为 `地区(colo)-序号`）。地区表见 `CF_COLO_REGION_ZH`（`src/shared/hostmonit.ts`）。
+- 无 **colo**：仅用 **下载速度（MB）** 生成短名（如 `13MB-01`）；**不再用延迟**参与起名。
+- 同组内同「基础串」多条时序号递增 `-01`、`-02`…
 
-`{aliasOrGroup}-{itemNameOrIp}`
+### 6.5 Hostmonit 扩展（管理页开关）
 
-规则：
+- 文案与说明页链接：[Hostmonit · CloudFlareYes](https://stock.hostmonit.com/CloudFlareYes)。
+- 关闭：订阅仅含**原始模板节点**（按实现约定展示）+ **用户自建分组**节点。
+- 开启：在订阅**末尾**追加 Hostmonit 返回的优选 IP 列表。
+- 设置通过管理页勾选 + `PATCH /api/tenant/settings`（见 §7）。
 
-- 分组展示名优先使用 alias；若无 alias，则使用 group key
-- 无论条目是否填写 `name`，节点名前缀都必须保留 `aliasOrGroup`，用于区分不同地点或网络环境下的结果
-- 若条目存在 `name` 且非空，使用 `name`
-- 否则使用 `ip`
+---
 
-示例：
-
-- `Home-HKG-01`
-- `Home-104.16.1.1`
-- `Cafe-SZ-Entry-A`
-
-## 7. Grouping
-
-分组键使用手动指定的字符串。
-
-为兼容现有 API，请求体字段名仍可沿用 `ssid`，但语义上视为 group key。
-
-展示名优先使用 alias：
-
-- 有 alias：显示 alias
-- 无 alias：显示原始分组名
-
-存储主键始终使用原始分组键，避免 alias 变更导致数据漂移。
-
-## 8. APIs
+## 7. APIs
 
 ### `POST /api/lookup`
 
-根据用户输入的链接定位已有租户，或在必要时创建租户。
+根据用户粘贴的链接定位或创建租户。
 
-请求体：
-
-```json
-{
-  "url": "https://example.com/sub/abc"
-}
-```
-
-支持输入：
-
-- 原始订阅 URL
-- 本站生成的 `subscriptionUrl`
-
-响应体：
-
-```json
-{
-  "tenantId": "t_xxx",
-  "accessToken": "t_xxx.access_xxx",
-  "isNew": false
-}
-```
-
-行为：
-
-- 当输入原始订阅 URL 时：若该 URL 已存在，则定位到已有租户；否则创建新租户
-- 当输入本站生成的 `subscriptionUrl` 时：直接解析出对应租户并进入管理
-- 前端随后跳转到 `/dashboard/:tenantId?token=<accessToken>`
+请求体：`{ "url": "<原始订阅 URL 或本站 subscriptionUrl>" }`  
+响应：`tenantId`、`accessToken`、`isNew`。  
+前端随后跳转 `/dashboard/:tenantId?token=<accessToken>`。
 
 ### `POST /api/tenants`
 
-创建租户。
-
-请求体：
-
-```json
-{
-  "originSubscriptionUrl": "https://example.com/sub/abc"
-}
-```
-
-响应体：
-
-```json
-{
-  "tenantId": "t_xxx",
-  "accessToken": "t_xxx.access_xxx",
-  "dashboardUrl": "https://service.example/dashboard/t_xxx?token=t_xxx.access_xxx",
-  "subscriptionUrl": "https://service.example/sub/t_xxx?token=t_xxx.access_xxx"
-}
-```
-
-说明：
-
-- `dashboardUrl` 和 `subscriptionUrl` 是当前 worker 实现返回的便捷结果。
-- 日常使用上，用户也可以在首页重新粘贴原始订阅 URL 或本站生成的 `subscriptionUrl` 来重新定位并进入管理。
+显式创建租户；响应含 `dashboardUrl`、`subscriptionUrl`。
 
 ### `GET /dashboard/:tenantId`
 
-返回该租户的管理页面。
-
-参数：
-
-- `token=<accessToken>`
-
-行为：
-
-- 展示当前租户信息
-- 支持 CSV 导入
-- 支持手动编辑 IP 条目
-- 支持保存分组条目
+Query：`token=<accessToken>`。返回 HTML 管理页。
 
 ### `POST /api/report`
 
-保存某个分组的最新条目。
+保存某分组条目（与页面「保存分组」一致）。
 
-Header：
+Header：`Authorization: Bearer <accessToken>`
 
-```text
-Authorization: Bearer <accessToken>
-```
-
-请求体：
+请求体示例：
 
 ```json
 {
@@ -309,97 +206,66 @@ Authorization: Bearer <accessToken>
       "speed": 12.4,
       "colo": "HKG"
     },
-    {
-      "ip": "104.16.1.2"
-    }
+    { "ip": "104.16.1.2" }
   ]
 }
 ```
 
-说明：
+说明：字段名 `results` 为历史兼容；语义为「该分组当前用于生成订阅的条目列表」。
 
-- 为兼容现有实现，请求体字段名仍可使用 `results`。
-- 语义上这里表示“该分组当前用于生成订阅的条目列表”。
-- CSV 导入后可直接提交，也可先在页面中编辑后再提交。
+### `GET /api/groups` / `GET /api/group` / `DELETE /api/group`
 
-### `GET /api/groups`
+Bearer 同上。`GET /api/group?group=<groupKey>` 返回该分组报告。
 
-返回当前租户已保存的分组列表及其摘要信息，供管理页面展示。
+### `PATCH /api/tenant/settings`
 
-### `GET /api/group`
-
-查询单个分组详情。
-
-参数（query）：
-
-- `group=<groupKey>`（与存储用的分组键一致，请求体里历史字段名为 `ssid`）
+更新租户可选设置（当前仅 **订阅扩展来源**）。
 
 Header：`Authorization: Bearer <accessToken>`
 
-### `DELETE /api/group`
+请求体示例：
 
-删除指定分组及其条目；若租户 `aliases` 中存在该分组键，一并移除。
+```json
+{
+  "subscriptionSources": {
+    "hostmonit": true
+  }
+}
+```
 
-参数（query）：`group=<groupKey>`  
-Header：`Authorization: Bearer <accessToken>`
+响应含 `ok` 与合并后的 `subscriptionSources`。
 
 ### `DELETE /api/tenant`
 
-删除当前租户：清空其全部分组报告、租户记录及 `originUrlHash` 映射（不可恢复）。
-
-Header：`Authorization: Bearer <accessToken>`
+删除当前租户及全部数据（不可恢复）。Bearer 同上。
 
 ### `GET /sub/:tenantId`
 
-返回该租户的代理订阅。
+Query：`token=<accessToken>`。返回 base64 代理订阅。
 
-参数：
+---
 
-- `token=<accessToken>`
+## 8. Architecture
 
-行为：
+- **Worker**：`src/worker/index.ts` — 路由、管理页 HTML、KV 读写、订阅拼装、Hostmonit 拉取与缓存。
+- **Shared**：`src/shared/` — 类型、`vless` 解析与生成、`cfst` CSV 解析、`hostmonit` 响应解析与地区/线路文案。
+- **Storage**：`KV` — 租户记录、分组报告；`Cache API` — Hostmonit 响应短期缓存（实现细节见代码）。
 
-- 读取该租户所有分组的最新条目
-- 基于原始节点模板生成多条 `vless://`
-- 拼接后 base64 返回
+---
 
-## 9. Dashboard Interaction
+## 9. Grouping 补充
 
-建议第一版支持以下交互：
+- 分组键为用户输入字符串；API 请求体仍可用历史字段名 `ssid`。
+- 存储主键为原始分组键；alias 仅影响展示与节点名前缀，变更 alias 不迁移键名。
 
-### Enter Management
-
-1. 用户在首页粘贴链接
-2. 支持两类输入：原始订阅 URL、本站生成的 `subscriptionUrl`
-3. 前端调用 `/api/lookup`
-4. 服务端定位已有租户或创建新租户
-5. 前端跳转到 `/dashboard/:tenantId?token=<accessToken>`
-
-### Import CSV
-
-1. 选择或输入分组名
-2. 上传 `CloudflareSpeedTest` 结果 CSV
-3. 页面解析 CSV
-4. 生成可编辑条目列表
-5. 用户修改 `ip` / `name`
-6. 用户可手动补充新条目
-7. 保存到 `/api/report`
-
-### Edit Manually
-
-1. 选择或输入分组名
-2. 从空列表开始，手动新增条目
-3. 每个条目至少填写 `ip`
-4. `name` 可留空，留空时默认使用 `ip`
-5. 保存到 `/api/report`
+---
 
 ## 10. Security
 
-- 原始订阅 URL 视为敏感信息
-- 当前 worker 实现中，管理页面访问、写入接口和订阅读取共用同一个 `accessToken`
-- 租户间数据严格隔离
-- 首页的链接定位能力仅用于根据用户主动提供的原始订阅 URL 或本站生成的 `subscriptionUrl` 查找对应租户
-- 服务端拉取原始订阅时需限制目标协议与请求行为，避免 SSRF
+- 原始订阅 URL、`accessToken` 视为敏感信息。
+- 租户间数据隔离；拉取原始订阅需限制协议与行为，避免 SSRF。
+
+---
 
 ## 11. Recommended Project Layout
 
@@ -407,42 +273,21 @@ Header：`Authorization: Bearer <accessToken>`
 src/
   worker/
   shared/
-docs/
-  examples/
 SPEC.md
 ```
 
-建议职责：
+---
 
-- `src/worker/`: 多租户后端与管理页面
-- `src/shared/`: 订阅解析、节点生成、CSV 解析、数据类型
+## 12. Milestones & Success Criteria
 
-## 12. Milestones
+### Milestones（简写）
 
-### M1
+- M1：租户创建、模板解析、固定订阅 URL。
+- M2：管理页 CSV + 保存分组。
+- M3：手动编辑、多分组聚合、客户端可导入。
 
-- 支持创建租户
-- 能解析原始订阅中的第一个 `vless://` 节点
-- 能生成固定代理订阅 URL
+### 成功标准
 
-### M2
-
-- 管理页面支持上传 `CloudflareSpeedTest` CSV
-- CSV 可转换为可编辑的 IP 条目列表
-- 可保存分组条目
-
-### M3
-
-- 管理页面支持手动新增、编辑、删除条目
-- Worker 能按分组键聚合结果
-- 代理订阅可被常见客户端（如 `Hiddify`）导入并使用
-
-## 13. Success Criteria
-
-满足以下条件即视为第一版成功：
-
-- 用户提交原始订阅 URL 后，拿到新的代理订阅 URL 和管理链接
-- 用户可以通过管理页面上传 CSV 或手动维护 IP 列表
-- 服务端能记录当前分组的最新条目集合
-- 兼容的客户端导入代理订阅 URL 后，能看到按分组名/alias 和条目名生成的多个节点
-- 节点基于原始模板，仅替换为对应的 `Cloudflare IP`
+- 用户拿到代理订阅 URL 与管理链接后，能通过 **CSV / 手动 / API** 维护分组。
+- 订阅中节点名符合分组与条目规则；模板仅替换 IP。
+- 可选 Hostmonit 在末尾追加且可通过设置关闭。
