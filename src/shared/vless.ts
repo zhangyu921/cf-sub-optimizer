@@ -83,11 +83,14 @@ export function buildNodeName(report: SsidReport, itemName?: string): string {
   return `${label}-${displayName}`;
 }
 
+/** 与原始订阅相同的入口（template.server）；名称以 `!` 开头，在多数客户端「按名称」字典序排序时排在字母/数字节点之前 */
+export const ORIGIN_NODE_DISPLAY_NAME = "!Origin";
+
 export function buildSubscriptionLines(
   template: OriginNodeTemplate,
   reports: SsidReport[],
 ): string[] {
-  const lines: string[] = [];
+  const lines: string[] = [buildVlessUrl(template, template.server, ORIGIN_NODE_DISPLAY_NAME)];
 
   for (const report of reports) {
     report.results.forEach((result) => {
