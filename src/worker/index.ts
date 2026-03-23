@@ -808,6 +808,15 @@ function dashboardPage(
       .table-hint { color: #888; font-size: 13px; margin-bottom: 12px; }
       .edit-actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
       .hidden { display: none; }
+      .csv-hint { font-size: 13px; color: #888; margin-bottom: 12px; line-height: 1.65; }
+      .csv-hint a { color: #0070f3; text-decoration: none; }
+      .csv-hint a:hover { text-decoration: underline; }
+      .csv-hint ul { margin: 8px 0 10px 1.1em; padding: 0; }
+      .csv-hint li { margin: 6px 0; }
+      .csv-hint code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; background: rgba(0, 0, 0, 0.06); padding: 2px 6px; border-radius: 4px; word-break: break-all; }
+      @media (prefers-color-scheme: dark) { .csv-hint code { background: rgba(255, 255, 255, 0.08); } }
+      .section label a { color: #0070f3; text-decoration: none; }
+      .section label a:hover { text-decoration: underline; }
     </style>
   </head>
   <body>
@@ -850,15 +859,27 @@ function dashboardPage(
       <div class="section-title">订阅扩展来源</div>
       <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
         <input type="checkbox" id="src-hostmonit" style="margin-top:4px;"${hostmonitChecked} />
-        <span>合并 Hostmonit 公开优选 IP（第三方维护，节点名含地区与线路）</span>
+        <span>合并 <a href="https://stock.hostmonit.com/CloudFlareYes" target="_blank" rel="noopener noreferrer">Hostmonit</a> 公开优选 IP（第三方维护，节点名含地区与线路）</span>
       </label>
-      <p style="font-size:13px;color:#888;margin-top:8px;">关闭时订阅仅含「!Origin」与下方自建分组；开启后在订阅<strong>末尾</strong>追加列表。后续还可在此增加其他来源。</p>
+      <p style="font-size:13px;color:#888;margin-top:8px;">关闭时订阅仅含原始节点与下方自建分组；开启时在订阅<strong>末尾</strong>追加 Hostmonit 提供的优选 IP 列表。</p>
       <div id="sources-message"></div>
     </div>
 
     <div class="section">
       <div class="section-title">导入 CSV 或手动编辑</div>
-      <p style="font-size:13px;color:#888;margin-bottom:12px;">CSV 默认名字规则与 Hostmonit 一致：有 colo 时为「地区名(colo)·线路-序号」；第 8 列可填线路代码 CM/CU/CT（显示为移动/联通/电信）。无 colo 时仍用延迟/速度生成短名。</p>
+      <div class="csv-hint">
+        <p style="margin:0 0 6px 0;">支持直接上传这两种工具导出的 CSV：</p>
+        <ul>
+          <li>
+            <a href="https://github.com/Leo-Mu/montecarlo-ip-searcher" target="_blank" rel="noopener noreferrer">montecarlo-ip-searcher（mcis）</a>：请加上 <code>--out csv</code>，并用 <code>--out-file</code> 保存成文件（默认输出可能是文字而不是 CSV）。
+            示例：<code>./mcis -v --out csv --out-file=result.csv --cidr-file ./ipv4cidr.txt --budget 3000 --concurrency 100</code>
+          </li>
+          <li>
+            <a href="https://github.com/XIU2/CloudflareSpeedTest" target="_blank" rel="noopener noreferrer">CloudflareSpeedTest（CFST）</a>：使用默认生成的 <code>result.csv</code> 即可。
+          </li>
+        </ul>
+        <p style="margin:0;">导入后会根据测速结果自动生成节点名称。其他来源请用下方「手动开始」或在表格里自行填写 IP 与名称。</p>
+      </div>
       <form class="upload-form" id="upload-form">
         <div class="form-row">
           <div class="form-group">
@@ -951,33 +972,86 @@ function dashboardPage(
         return CF_LINE_ZH[k] || line || "";
       }
 
-      function parseCsv(text) {
-        const lines = text.split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);
-        if (lines.length <= 1) return [];
+      function stripBom(s) {
+        return s && s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
+      }
+
+      function normalizeHeaderCell(h) {
+        return stripBom(h).trim().toLowerCase();
+      }
+
+      function looksLikeNamedHeaderRow(headerCells) {
+        const h = headerCells.map(normalizeHeaderCell);
+        const set = new Set(h);
+        if (!set.has("ip")) return false;
+        if (set.has("download_mbps")) return true;
+        if (set.has("rank") && set.has("score_ms")) return true;
+        if (set.has("rank") && set.has("prefix")) return true;
+        return false;
+      }
+
+      function headerRowHasIpColumn(headerCells) {
+        return headerCells.map(normalizeHeaderCell).includes("ip");
+      }
+
+      function secondRowLooksLikeRankThenIp(lines) {
+        if (lines.length < 2) return false;
+        const parts = lines[1].split(",");
+        if (parts.length < 2) return false;
+        const a = (parts[0] || "").trim();
+        const b = (parts[1] || "").trim();
+        if (!/^\\d+$/.test(a)) return false;
+        if (/^\\d{1,3}(\\.\\d{1,3}){3}$/.test(b)) return true;
+        if (b.indexOf(":") >= 0 && b.length >= 3) return true;
+        return false;
+      }
+
+      function shouldParseNamedCsv(lines) {
+        const firstRowCells = lines[0].split(",").map((c) => c.trim());
+        if (looksLikeNamedHeaderRow(firstRowCells)) return true;
+        if (headerRowHasIpColumn(firstRowCells) && secondRowLooksLikeRankThenIp(lines)) return true;
+        return false;
+      }
+
+      function cell(parts, index) {
+        return (parts[index] || "").trim();
+      }
+
+      function buildName(coloCode, lineCode, spd, baseCounters, fallbackCounters) {
+        if (coloCode) {
+          const region = coloRegionZh(coloCode);
+          const lineZh = lineCode ? lineLabelZh(lineCode) : "";
+          const base = lineZh ? region + "(" + coloCode + ")·" + lineZh : region + "(" + coloCode + ")";
+          baseCounters[base] = (baseCounters[base] || 0) + 1;
+          return base + "-" + String(baseCounters[base]).padStart(2, "0");
+        }
+        const hintParts = [];
+        if (Number.isFinite(spd) && spd > 0) hintParts.push(Math.round(spd) + "MB");
+        const base = hintParts.length > 0 ? hintParts.join("-") : "IP";
+        fallbackCounters[base] = (fallbackCounters[base] || 0) + 1;
+        return base + "-" + String(fallbackCounters[base]).padStart(2, "0");
+      }
+
+      function parseLegacyFixedRows(lines) {
+        const headerCells = lines[0].split(",").map((c) => c.trim());
+        if (headerRowHasIpColumn(headerCells) && secondRowLooksLikeRankThenIp(lines)) {
+          return parseNamedHeaderRows(lines);
+        }
         const baseCounters = {};
         const fallbackCounters = {};
         return lines.slice(1).map((line) => {
           const parts = line.split(",");
-          const [ip, , , loss, latency, speed, colo, lineRaw] = parts;
+          const ip = parts[0];
+          const loss = parts[3];
+          const latency = parts[4];
+          const speed = parts[5];
+          const colo = parts[6];
+          const lineRaw = parts[7];
           const coloCode = (colo || "").trim().toUpperCase();
           const lineCode = (lineRaw || "").trim();
           const lat = parseNumber(latency);
           const spd = parseNumber(speed);
-          let name = "";
-          if (coloCode) {
-            const region = coloRegionZh(coloCode);
-            const lineZh = lineCode ? lineLabelZh(lineCode) : "";
-            const base = lineZh ? region + "(" + coloCode + ")·" + lineZh : region + "(" + coloCode + ")";
-            baseCounters[base] = (baseCounters[base] || 0) + 1;
-            name = base + "-" + String(baseCounters[base]).padStart(2, "0");
-          } else {
-            const hintParts = [];
-            if (Number.isFinite(lat)) hintParts.push(Math.round(lat) + "ms");
-            if (Number.isFinite(spd) && spd > 0) hintParts.push(Math.round(spd) + "MB");
-            const base = hintParts.length > 0 ? hintParts.join("-") : "IP";
-            fallbackCounters[base] = (fallbackCounters[base] || 0) + 1;
-            name = base + "-" + String(fallbackCounters[base]).padStart(2, "0");
-          }
+          const name = buildName(coloCode, lineCode, spd, baseCounters, fallbackCounters);
           return {
             ip: (ip || "").trim(),
             name: name,
@@ -987,6 +1061,62 @@ function dashboardPage(
             colo: coloCode || undefined,
           };
         }).filter((r) => r.ip);
+      }
+
+      function parseNamedHeaderRows(lines) {
+        const headerCells = lines[0].split(",").map((c) => c.trim());
+        const headers = headerCells.map(normalizeHeaderCell);
+        function idx(name) {
+          return headers.indexOf(name);
+        }
+        const ipI = idx("ip");
+        if (ipI < 0) return [];
+        const coloI = idx("colo");
+        const speedI = idx("download_mbps");
+        const legacySpeedI = idx("speed");
+        const lossI = idx("loss");
+        const lineI = idx("line");
+        const scoreI = idx("score_ms");
+        const totalI = idx("total_ms");
+        const latencyI = idx("latency");
+        const baseCounters = {};
+        const fallbackCounters = {};
+        return lines.slice(1).map((line) => {
+          const parts = line.split(",");
+          const ip = cell(parts, ipI);
+          const coloCode = coloI >= 0 ? cell(parts, coloI).toUpperCase() : "";
+          const lineCode = lineI >= 0 ? cell(parts, lineI) : "";
+          let spd = undefined;
+          if (speedI >= 0) spd = parseNumber(cell(parts, speedI));
+          if (spd === undefined && legacySpeedI >= 0) spd = parseNumber(cell(parts, legacySpeedI));
+          let lat = undefined;
+          if (latencyI >= 0) lat = parseNumber(cell(parts, latencyI));
+          if (lat === undefined && scoreI >= 0) lat = parseNumber(cell(parts, scoreI));
+          if (lat === undefined && totalI >= 0) lat = parseNumber(cell(parts, totalI));
+          let loss = 0;
+          if (lossI >= 0) {
+            const v = parseNumber(cell(parts, lossI));
+            loss = v !== undefined ? v : 0;
+          }
+          const name = buildName(coloCode, lineCode, spd, baseCounters, fallbackCounters);
+          return {
+            ip: ip,
+            name: name,
+            loss: loss,
+            latency: lat,
+            speed: spd,
+            colo: coloCode || undefined,
+          };
+        }).filter((r) => r.ip);
+      }
+
+      function parseCsv(text) {
+        const lines = text.split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);
+        if (lines.length <= 1) return [];
+        if (shouldParseNamedCsv(lines)) {
+          return parseNamedHeaderRows(lines);
+        }
+        return parseLegacyFixedRows(lines);
       }
 
       function pickTop(results, n) {
