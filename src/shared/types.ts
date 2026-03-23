@@ -28,6 +28,11 @@ export interface OriginNodeTemplate {
   name?: string;
 }
 
+/** 第三方/外部订阅来源开关，可按 key 扩展 */
+export interface SubscriptionSourceFlags {
+  hostmonit?: boolean;
+}
+
 export interface TenantConfig {
   tenantId: string;
   originSubscriptionUrl: string;
@@ -36,6 +41,8 @@ export interface TenantConfig {
   originUrlHash: string;
   aliases: Record<string, string>;
   topN: number;
+  /** 未写入 KV 的旧租户视为全部关闭 */
+  subscriptionSources?: SubscriptionSourceFlags;
 }
 
 export interface TenantRecord extends TenantConfig {
@@ -72,3 +79,7 @@ export interface GroupSummary {
 }
 
 export interface ReportPayload extends SsidReport {}
+
+export interface PatchTenantSettingsInput {
+  subscriptionSources?: SubscriptionSourceFlags;
+}

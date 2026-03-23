@@ -5,10 +5,18 @@ import type {
   LookupInput,
   LookupOutput,
   OriginNodeTemplate,
+  PatchTenantSettingsInput,
   ReportPayload,
   SsidReport,
+  SubscriptionSourceFlags,
   TenantRecord,
 } from "../shared/types.js";
+import type { HostmonitOptimizedEntry } from "../shared/hostmonit.js";
+import {
+  CF_COLO_REGION_ZH,
+  CF_LINE_ZH,
+  parseHostmonitOptimizationResponse,
+} from "../shared/hostmonit.js";
 import { buildSubscriptionLines, encodeSubscription, extractFirstVlessTemplate, parseVlessUrl } from "../shared/vless.js";
 
 export interface Env {
@@ -19,6 +27,19 @@ export interface Env {
 export interface SubscriptionContext {
   template: OriginNodeTemplate;
   reports: SsidReport[];
+  hostmonitEntries?: HostmonitOptimizedEntry[];
+}
+
+const HOSTMONIT_API_URL = "https://api.hostmonit.com/get_optimization_ip";
+/** 与 stock.hostmonit 前端一致，为公开 key */
+const HOSTMONIT_PUBLIC_KEY = "iDetkOys";
+const HOSTMONIT_FETCH_TIMEOUT_MS = 8_000;
+const HOSTMONIT_CACHE_MAX_AGE_SEC = 600;
+const HOSTMONIT_CACHE_REQUEST = new Request("https://cache.cf-sub-optimizer.invalid/hostmonit-optimization-v1");
+
+interface CachedHostmonitPayload {
+  expiresAt: number;
+  entries: HostmonitOptimizedEntry[];
 }
 
 const jsonHeaders = {
@@ -34,7 +55,7 @@ const textHeaders = {
 };
 
 export function renderSubscription(context: SubscriptionContext): string {
-  const lines = buildSubscriptionLines(context.template, context.reports);
+  const lines = buildSubscriptionLines(context.template, context.reports, context.hostmonitEntries ?? []);
   return encodeSubscription(lines);
 }
 
@@ -237,6 +258,88 @@ async function fetchOriginSubscriptionPassthroughHeaders(originSubscriptionUrl: 
   return out;
 }
 
+function mergeSubscriptionSources(tenant: TenantRecord): SubscriptionSourceFlags {
+  return {
+    hostmonit: false,
+    ...tenant.subscriptionSources,
+  };
+}
+
+function parseHostmonitCachePayload(text: string): CachedHostmonitPayload | null {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== "object") return null;
+    const o = parsed as { expiresAt?: unknown; entries?: unknown };
+    if (typeof o.expiresAt !== "number" || !Array.isArray(o.entries)) return null;
+    return { expiresAt: o.expiresAt, entries: o.entries as HostmonitOptimizedEntry[] };
+  } catch {
+    return null;
+  }
+}
+
+async function readHostmonitCache(cache: Cache): Promise<CachedHostmonitPayload | null> {
+  const hit = await cache.match(HOSTMONIT_CACHE_REQUEST);
+  if (!hit) return null;
+  const text = await hit.text();
+  return parseHostmonitCachePayload(text);
+}
+
+async function loadHostmonitEntriesWithCache(): Promise<HostmonitOptimizedEntry[]> {
+  const cache = (caches as unknown as { default: Cache }).default;
+  const now = Date.now();
+
+  const fresh = await readHostmonitCache(cache);
+  if (fresh && fresh.expiresAt > now && fresh.entries.length > 0) {
+    return fresh.entries;
+  }
+
+  try {
+    const response = await fetch(HOSTMONIT_API_URL, {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/plain, */*",
+        "content-type": "application/json",
+        Referer: "https://stock.hostmonit.com/",
+      },
+      body: JSON.stringify({ key: HOSTMONIT_PUBLIC_KEY }),
+      signal: AbortSignal.timeout(HOSTMONIT_FETCH_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      return staleHostmonitFallback(fresh);
+    }
+
+    const data: unknown = await response.json();
+    const entries = parseHostmonitOptimizationResponse(data);
+    if (entries.length > 0) {
+      const payload: CachedHostmonitPayload = {
+        expiresAt: now + HOSTMONIT_CACHE_MAX_AGE_SEC * 1000,
+        entries,
+      };
+      await cache.put(
+        HOSTMONIT_CACHE_REQUEST,
+        new Response(JSON.stringify(payload), {
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": `max-age=${HOSTMONIT_CACHE_MAX_AGE_SEC}`,
+          },
+        }),
+      );
+      return entries;
+    }
+    return staleHostmonitFallback(fresh);
+  } catch {
+    return staleHostmonitFallback(fresh);
+  }
+}
+
+function staleHostmonitFallback(previous: CachedHostmonitPayload | null): HostmonitOptimizedEntry[] {
+  if (previous?.entries?.length) {
+    return previous.entries;
+  }
+  return [];
+}
+
 function isOurSubscriptionUrl(inputUrl: string, requestOrigin: string): boolean {
   try {
     const parsed = new URL(inputUrl);
@@ -280,6 +383,7 @@ async function createNewTenant(
     originUrlHash,
     aliases: {},
     topN: 5,
+    subscriptionSources: { hostmonit: false },
     createdAt: new Date().toISOString(),
   };
 
@@ -536,9 +640,16 @@ async function getProxySubscription(request: Request, env: Env, tenantId: string
   }
 
   const reports = await loadReports(env, tenantId);
+  const sources = mergeSubscriptionSources(tenant);
+  let hostmonitEntries: HostmonitOptimizedEntry[] = [];
+  if (sources.hostmonit) {
+    hostmonitEntries = await loadHostmonitEntriesWithCache();
+  }
+
   const subscription = renderSubscription({
     template: tenant.originNodeTemplate,
     reports,
+    hostmonitEntries,
   });
 
   const passthrough = await fetchOriginSubscriptionPassthroughHeaders(tenant.originSubscriptionUrl);
@@ -629,10 +740,14 @@ function dashboardPage(
   accessToken: string,
   originSubscriptionUrl: string,
   topN: number,
+  subscriptionSources: SubscriptionSourceFlags,
 ): string {
   const subscriptionUrl = `${origin}/sub/${tenantId}?token=${accessToken}`;
   const dashboardUrl = `${origin}/dashboard/${tenantId}?token=${accessToken}`;
   const escAttr = (s: string) => s.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;");
+  const hostmonitChecked = subscriptionSources.hostmonit ? " checked" : "";
+  const coloMapJson = JSON.stringify(CF_COLO_REGION_ZH);
+  const lineMapJson = JSON.stringify(CF_LINE_ZH);
 
   return `<!doctype html>
 <html lang="zh-CN">
@@ -732,7 +847,18 @@ function dashboardPage(
     </div>
 
     <div class="section">
+      <div class="section-title">订阅扩展来源</div>
+      <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+        <input type="checkbox" id="src-hostmonit" style="margin-top:4px;"${hostmonitChecked} />
+        <span>合并 Hostmonit 公开优选 IP（第三方维护，节点名含地区与线路）</span>
+      </label>
+      <p style="font-size:13px;color:#888;margin-top:8px;">关闭时订阅仅含「!Origin」与下方自建分组；开启后在订阅<strong>末尾</strong>追加列表。后续还可在此增加其他来源。</p>
+      <div id="sources-message"></div>
+    </div>
+
+    <div class="section">
       <div class="section-title">导入 CSV 或手动编辑</div>
+      <p style="font-size:13px;color:#888;margin-bottom:12px;">CSV 默认名字规则与 Hostmonit 一致：有 colo 时为「地区名(colo)·线路-序号」；第 8 列可填线路代码 CM/CU/CT（显示为移动/联通/电信）。无 colo 时仍用延迟/速度生成短名。</p>
       <form class="upload-form" id="upload-form">
         <div class="form-row">
           <div class="form-group">
@@ -788,6 +914,8 @@ function dashboardPage(
     <script>
       const ACCESS_TOKEN = ${JSON.stringify(accessToken)};
       const CSV_TOP_N = ${Math.max(1, Math.min(200, topN))};
+      const CF_COLO_REGION_ZH = ${coloMapJson};
+      const CF_LINE_ZH = ${lineMapJson};
       let currentEditGroup = "";
       let currentEditItems = [];
 
@@ -813,25 +941,40 @@ function dashboardPage(
         return Number.isFinite(n) ? n : undefined;
       }
 
+      function coloRegionZh(code) {
+        const c = (code || "").trim().toUpperCase();
+        return CF_COLO_REGION_ZH[c] || c;
+      }
+
+      function lineLabelZh(line) {
+        const k = (line || "").trim().toUpperCase();
+        return CF_LINE_ZH[k] || line || "";
+      }
+
       function parseCsv(text) {
         const lines = text.split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);
         if (lines.length <= 1) return [];
-        const coloCounters = {};
+        const baseCounters = {};
         const fallbackCounters = {};
         return lines.slice(1).map((line) => {
-          const [ip, , , loss, latency, speed, colo] = line.split(",");
+          const parts = line.split(",");
+          const [ip, , , loss, latency, speed, colo, lineRaw] = parts;
           const coloCode = (colo || "").trim().toUpperCase();
+          const lineCode = (lineRaw || "").trim();
           const lat = parseNumber(latency);
           const spd = parseNumber(speed);
           let name = "";
           if (coloCode) {
-            coloCounters[coloCode] = (coloCounters[coloCode] || 0) + 1;
-            name = coloCode + "-" + String(coloCounters[coloCode]).padStart(2, "0");
+            const region = coloRegionZh(coloCode);
+            const lineZh = lineCode ? lineLabelZh(lineCode) : "";
+            const base = lineZh ? region + "(" + coloCode + ")·" + lineZh : region + "(" + coloCode + ")";
+            baseCounters[base] = (baseCounters[base] || 0) + 1;
+            name = base + "-" + String(baseCounters[base]).padStart(2, "0");
           } else {
-            const parts = [];
-            if (Number.isFinite(lat)) parts.push(Math.round(lat) + "ms");
-            if (Number.isFinite(spd) && spd > 0) parts.push(Math.round(spd) + "MB");
-            const base = parts.length > 0 ? parts.join("-") : "IP";
+            const hintParts = [];
+            if (Number.isFinite(lat)) hintParts.push(Math.round(lat) + "ms");
+            if (Number.isFinite(spd) && spd > 0) hintParts.push(Math.round(spd) + "MB");
+            const base = hintParts.length > 0 ? hintParts.join("-") : "IP";
             fallbackCounters[base] = (fallbackCounters[base] || 0) + 1;
             name = base + "-" + String(fallbackCounters[base]).padStart(2, "0");
           }
@@ -1146,6 +1289,28 @@ function dashboardPage(
       window.startManualEdit = startManualEdit;
       window.deleteTenantWithConfirm = deleteTenantWithConfirm;
 
+      document.getElementById("src-hostmonit").addEventListener("change", async (e) => {
+        const input = e.target;
+        if (!(input instanceof HTMLInputElement)) return;
+        const checked = input.checked;
+        try {
+          const resp = await fetch("/api/tenant/settings", {
+            method: "PATCH",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: "Bearer " + ACCESS_TOKEN,
+            },
+            body: JSON.stringify({ subscriptionSources: { hostmonit: checked } }),
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "保存失败");
+          showMessage("sources-message", "success", "已保存");
+        } catch (err) {
+          input.checked = !checked;
+          showMessage("sources-message", "error", getErrorMessage(err));
+        }
+      });
+
       loadGroups();
     </script>
   </body>
@@ -1168,7 +1333,33 @@ async function serveDashboard(request: Request, env: Env, tenantId: string): Pro
   }
 
   const origin = new URL(request.url).origin;
-  return html(dashboardPage(origin, tenantId, token, tenant.originSubscriptionUrl, tenant.topN ?? 5));
+  return html(
+    dashboardPage(origin, tenantId, token, tenant.originSubscriptionUrl, tenant.topN ?? 5, mergeSubscriptionSources(tenant)),
+  );
+}
+
+async function patchTenantSettings(request: Request, env: Env): Promise<Response> {
+  const token = parseBearerToken(request);
+  const tenantId = extractTenantIdFromToken(token);
+  const tenant = await requireTenant(env, tenantId);
+
+  if (tenant.accessToken !== token) {
+    return errorResponse(401, "访问令牌无效");
+  }
+
+  const body = await readJson<PatchTenantSettingsInput>(request);
+  const next = mergeSubscriptionSources(tenant);
+
+  if (body.subscriptionSources) {
+    if (typeof body.subscriptionSources.hostmonit === "boolean") {
+      next.hostmonit = body.subscriptionSources.hostmonit;
+    }
+  }
+
+  const updated: TenantRecord = { ...tenant, subscriptionSources: next };
+  await env.TENANTS.put(getTenantKey(tenantId), JSON.stringify(updated));
+
+  return json({ ok: true, subscriptionSources: next });
 }
 
 async function deleteTenant(request: Request, env: Env): Promise<Response> {
@@ -1230,6 +1421,10 @@ export default {
 
       if (request.method === "DELETE" && url.pathname === "/api/tenant") {
         return await deleteTenant(request, env);
+      }
+
+      if (request.method === "PATCH" && url.pathname === "/api/tenant/settings") {
+        return await patchTenantSettings(request, env);
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/dashboard/")) {

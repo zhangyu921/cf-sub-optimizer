@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 
+import type { HostmonitOptimizedEntry } from "./hostmonit.js";
 import type { OriginNodeTemplate, SsidReport } from "./types.js";
 
 function ensure(condition: unknown, message: string): asserts condition {
@@ -10,6 +11,15 @@ function ensure(condition: unknown, message: string): asserts condition {
 
 function toUrlSafeName(name: string): string {
   return encodeURIComponent(name);
+}
+
+/** IPv6 在 vless authority 中需方括号，否则 URL 解析会错 */
+function formatVlessHost(server: string): string {
+  const s = server.trim();
+  if (s.includes(":") && !s.startsWith("[")) {
+    return `[${s}]`;
+  }
+  return s;
 }
 
 export function parseVlessUrl(rawUrl: string): OriginNodeTemplate {
@@ -63,7 +73,8 @@ export function extractFirstVlessTemplate(subscriptionText: string): OriginNodeT
 }
 
 export function buildVlessUrl(template: OriginNodeTemplate, server: string, name: string): string {
-  const url = new URL(`vless://${template.uuid}@${server}:${template.port}`);
+  const host = formatVlessHost(server);
+  const url = new URL(`vless://${template.uuid}@${host}:${template.port}`);
 
   url.searchParams.set("encryption", template.encryption);
   url.searchParams.set("host", template.host);
@@ -89,6 +100,7 @@ export const ORIGIN_NODE_DISPLAY_NAME = "!Origin";
 export function buildSubscriptionLines(
   template: OriginNodeTemplate,
   reports: SsidReport[],
+  hostmonitEntries: HostmonitOptimizedEntry[] = [],
 ): string[] {
   const lines: string[] = [buildVlessUrl(template, template.server, ORIGIN_NODE_DISPLAY_NAME)];
 
@@ -98,6 +110,10 @@ export function buildSubscriptionLines(
       const name = buildNodeName(report, itemName);
       lines.push(buildVlessUrl(template, result.ip, name));
     });
+  }
+
+  for (const entry of hostmonitEntries) {
+    lines.push(buildVlessUrl(template, entry.ip, entry.name));
   }
 
   return lines;

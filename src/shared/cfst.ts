@@ -1,3 +1,4 @@
+import { coloRegionZh, hostmonitLineLabel } from "./hostmonit.js";
 import type { SpeedTestResult } from "./types.js";
 
 function parseNumber(value: string): number {
@@ -22,27 +23,32 @@ export function parseCfstCsv(csvText: string): SpeedTestResult[] {
     return [];
   }
 
-  const coloCounters: Record<string, number> = {};
+  const baseCounters: Record<string, number> = {};
   const fallbackCounters: Record<string, number> = {};
 
   return lines
     .slice(1)
     .map((line) => {
-    const [ipRaw, , , lossRaw, latencyRaw, speedRaw, coloRaw] = line.split(",");
+    const parts = line.split(",");
+    const [ipRaw, , , lossRaw, latencyRaw, speedRaw, coloRaw, lineRaw] = parts;
     const ip = (ipRaw || "").trim();
     const coloCode = (coloRaw || "").trim().toUpperCase();
+    const lineCode = (lineRaw || "").trim();
     const latency = parseOptionalNumber(latencyRaw);
     const speed = parseOptionalNumber(speedRaw);
 
     let name: string;
     if (coloCode) {
-      coloCounters[coloCode] = (coloCounters[coloCode] || 0) + 1;
-      name = `${coloCode}-${String(coloCounters[coloCode]).padStart(2, "0")}`;
+      const region = coloRegionZh(coloCode);
+      const lineZh = lineCode ? hostmonitLineLabel(lineCode) : "";
+      const base = lineZh ? `${region}(${coloCode})·${lineZh}` : `${region}(${coloCode})`;
+      baseCounters[base] = (baseCounters[base] || 0) + 1;
+      name = `${base}-${String(baseCounters[base]).padStart(2, "0")}`;
     } else {
-      const parts: string[] = [];
-      if (latency !== undefined) parts.push(`${Math.round(latency)}ms`);
-      if (speed !== undefined && speed > 0) parts.push(`${Math.round(speed)}MB`);
-      const base = parts.length > 0 ? parts.join("-") : "IP";
+      const hintParts: string[] = [];
+      if (latency !== undefined) hintParts.push(`${Math.round(latency)}ms`);
+      if (speed !== undefined && speed > 0) hintParts.push(`${Math.round(speed)}MB`);
+      const base = hintParts.length > 0 ? hintParts.join("-") : "IP";
       fallbackCounters[base] = (fallbackCounters[base] || 0) + 1;
       name = `${base}-${String(fallbackCounters[base]).padStart(2, "0")}`;
     }
