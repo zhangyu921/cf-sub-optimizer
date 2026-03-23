@@ -179,6 +179,13 @@ async function migrateTenantOriginHash(
   return migrated;
 }
 
+/** 客户端（Clash / Hiddify 等）从原始订阅 HTTP 响应里读这些头展示流量与到期时间；代理订阅需回传。 */
+const ORIGIN_SUBSCRIPTION_PASSTHROUGH_HEADER_NAMES = [
+  "subscription-userinfo",
+  "profile-update-interval",
+  "profile-web-page-url",
+] as const;
+
 async function fetchOriginSubscriptionTemplate(originSubscriptionUrl: string): Promise<OriginNodeTemplate> {
   if (originSubscriptionUrl.startsWith("vless://")) {
     return parseVlessUrl(originSubscriptionUrl);
@@ -196,6 +203,38 @@ async function fetchOriginSubscriptionTemplate(originSubscriptionUrl: string): P
 
   const subscriptionText = await response.text();
   return extractFirstVlessTemplate(subscriptionText);
+}
+
+/** 向原始订阅发一次轻量 GET，仅取出用量相关响应头；失败时返回空，不影响主订阅正文。 */
+async function fetchOriginSubscriptionPassthroughHeaders(originSubscriptionUrl: string): Promise<Headers> {
+  const out = new Headers();
+  if (originSubscriptionUrl.startsWith("vless:")) {
+    return out;
+  }
+
+  try {
+    const response = await fetch(originSubscriptionUrl, {
+      headers: {
+        "user-agent": "cf-sub-optimizer/0.1",
+      },
+      signal: AbortSignal.timeout(12_000),
+    });
+
+    if (!response.ok) {
+      return out;
+    }
+
+    for (const name of ORIGIN_SUBSCRIPTION_PASSTHROUGH_HEADER_NAMES) {
+      const value = response.headers.get(name);
+      if (value) {
+        out.set(name, value);
+      }
+    }
+  } catch {
+    // 上游不可达或超时时仍返回优化后的订阅正文，只是本周期无用量头
+  }
+
+  return out;
 }
 
 function isOurSubscriptionUrl(inputUrl: string, requestOrigin: string): boolean {
@@ -502,7 +541,13 @@ async function getProxySubscription(request: Request, env: Env, tenantId: string
     reports,
   });
 
-  return text(subscription);
+  const passthrough = await fetchOriginSubscriptionPassthroughHeaders(tenant.originSubscriptionUrl);
+  const headers = new Headers(textHeaders);
+  passthrough.forEach((value, key) => {
+    headers.set(key, value);
+  });
+
+  return new Response(subscription, { headers });
 }
 
 function landingPage(): string {
